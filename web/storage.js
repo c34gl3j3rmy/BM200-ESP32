@@ -1,0 +1,4 @@
+const DB_NAME='bm200-offline';const DB_VERSION=1;
+function openCaptureDB(){return new Promise((resolve,reject)=>{const req=indexedDB.open(DB_NAME,DB_VERSION);req.onupgradeneeded=()=>{const db=req.result;if(!db.objectStoreNames.contains('captures'))db.createObjectStore('captures',{keyPath:'captureAt'})};req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error)})}
+async function storeCapture(capture){const db=await openCaptureDB();try{await new Promise((resolve,reject)=>{const tx=db.transaction('captures','readwrite');tx.objectStore('captures').put(capture);tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error)})}finally{db.close()}}
+async function readCaptures(){const db=await openCaptureDB();try{return await new Promise((resolve,reject)=>{const req=db.transaction('captures','readonly').objectStore('captures').getAll();req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error)})}finally{db.close()}}
