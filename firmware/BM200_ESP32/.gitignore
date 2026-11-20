@@ -1,0 +1,14 @@
+# Never publish Wi-Fi credentials.
+Secrets.h
+
+# Arduino IDE / test artifacts
+*.bin
+*.elf
+*.map
+*.hex
+*.log
+*.csv
+*.json
+build/
+tests/_protocol_test_bin
+tests/_web_check.js
