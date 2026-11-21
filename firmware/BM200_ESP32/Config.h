@@ -7,7 +7,7 @@ static const char* WIFI_STA_SSID = "WifiGG";
 static const char* WIFI_HOSTNAME = "bm200-esp32";
 static const char* WIFI_AP_NAME = "BM200-ESP32";
 
-// V1.5.2: Wi-Fi domestique prioritaire (mode STA), AP de secours distinct.
+// V1.5.3: Wi-Fi domestique prioritaire (mode STA), AP de secours distinct.
 // Les modes STA et AP ne sont jamais actifs simultanement : cela elimine
 // les tentatives de reconnexion qui perturbaient les premiers diagnostics.
 static const uint32_t WIFI_STA_BOOT_TIMEOUT_MS = 20000; // Maximum au demarrage.
@@ -15,6 +15,12 @@ static const uint32_t WIFI_FALLBACK_AFTER_MS = 12000; // Perte d'une liaison eta
 static const uint32_t WIFI_AP_RETRY_INTERVAL_MS = 30000; // Si softAP echoue.
 static const uint32_t WIFI_AP_HOME_RETRY_INTERVAL_MS = 15UL * 60UL * 1000UL; // AP idle 15 min -> retry home.
 static const uint32_t WIFI_AP_IDLE_BEFORE_RETRY_MS = 2UL * 60UL * 1000UL; // Never interrupt active clients.
+
+// Core 4.x: successful diagnostic on Freebox WPA2/3 Compatible Mode.
+// True disables the ESP32 RSN Override WPA3 negotiation; ESP32 joins via
+// WPA2-AES. The Freebox WPA2/WPA3 and GCMP-256 settings remain unchanged.
+// Applied again after each AP -> STA transition. Not needed on Core 3.x.
+static const bool WIFI_DISABLE_WPA3_RSN_OVERRIDE = true;
 
 // Target BLE MAC from your BM200 captures. Match MAC only, not advertised name.
 static const char* BM200_BLE_MAC = "C8:17:F5:29:4E:F8";

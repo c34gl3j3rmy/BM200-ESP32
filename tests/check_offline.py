@@ -61,6 +61,11 @@ assert ino_source.index('registerRoutes();') < ino_source.index('ensureNetworkHt
 assert 'LittleFS.begin(ALLOW_LITTLEFS_AUTOFORMAT)' in ino_source
 assert 'ALLOW_LITTLEFS_AUTOFORMAT = false' in config_source
 assert 'WIFI_AP_HOME_RETRY_INTERVAL_MS' in wifi_source
+assert 'cfg.sta.disable_wpa3_compatible_mode' in wifi_source
+assert 'esp_wifi_get_config' in wifi_source
+assert 'esp_wifi_set_config' in wifi_source
+assert 'esp_wifi_connect()' in wifi_source
+assert 'WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD, 0, nullptr, false)' in wifi_source
 assert 'WiFi.softAPgetStationNum()' in wifi_source
 
 # Never disclose actual credentials in public firmware/configuration/documentation.
@@ -77,11 +82,13 @@ for secret in secret_values:
 print("Sequential Wi-Fi, LittleFS protection and credentials: OK")
 
 # Compile the actual network module against independent Arduino API mocks.
-mock_bin = TESTS / "_wifi_state_machine_bin"
-run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
-     str(TESTS / "wifi_state_machine_test.cpp"), "-o", str(mock_bin)])
-print(run([str(mock_bin)]).stdout.decode().strip())
-mock_bin.unlink(missing_ok=True)
+for core_major in [3, 4]:
+    mock_bin = TESTS / f"_wifi_state_machine_bin_{core_major}"
+    run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
+         f"-DESP_ARDUINO_VERSION_MAJOR={core_major}",
+         str(TESTS / "wifi_state_machine_test.cpp"), "-o", str(mock_bin)])
+    print(f"Core {core_major}: " + run([str(mock_bin)]).stdout.decode().strip())
+    mock_bin.unlink(missing_ok=True)
 
 # Prevent reintroducing a dependency on internal NimBLE host include paths.
 assert "#include <host/ble_hs.h>" not in firmware

@@ -1,10 +1,10 @@
-# BM200 ESP32 - V1.5.2 (Wi-Fi STA + AP de secours)
+# BM200 ESP32 - V1.5.3 (Wi-Fi STA + AP de secours)
 
 Passerelle locale BLE / Wi-Fi pour le moniteur de batterie ANCEL BM200. Le firmware
 ESP32 collecte des mesures, conserve un historique LittleFS et expose une API HTTP.
 La PWA statique dans `web/` est publiee separement via GitHub Pages.
 
-## Ce qui change dans la V1.5.2
+## Ce qui change dans la V1.5.3
 
 - Le Wi-Fi domestique est initialise en premier, comme dans la V1.5.1 validee
   sur `WifiGG`. Le serveur HTTP n'est ouvert qu'apres connexion au reseau.

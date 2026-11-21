@@ -1,5 +1,5 @@
 /*
- * ANCEL BM200 - BLE to Wi-Fi gateway V1.5.2 STA-first with AP-only fallback.
+ * ANCEL BM200 - BLE to Wi-Fi gateway V1.5.3 Core4 RSN Override workaround and AP-only fallback.
  * Board: ESP32-WROOM-32 / ESP32 Dev Module (classic ESP32).
  * Arduino ESP32 cores 3.3.13 / 4.0.0 and NimBLE-Arduino 2.5.x.
  *
@@ -16,6 +16,10 @@
 #include <esp_attr.h>
 #include <esp_heap_caps.h>
 #include <WiFi.h>
+#if ESP_ARDUINO_VERSION_MAJOR >= 4
+#include <esp_wifi.h>
+#include <esp_err.h>
+#endif
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <LittleFS.h>
@@ -207,7 +211,7 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(250);
     Serial.println();
-    Serial.println("==== ANCEL BM200 ESP32 Wi-Fi Gateway V1.5.2 STA+AP ====");
+    Serial.println("==== ANCEL BM200 ESP32 Wi-Fi Gateway V1.5.3 Core4 RSN+AP ====");
     Serial.printf("[BOOT] Arduino ESP32 Core %d.%d.%d\n",
                   ESP_ARDUINO_VERSION_MAJOR, ESP_ARDUINO_VERSION_MINOR,
                   ESP_ARDUINO_VERSION_PATCH);

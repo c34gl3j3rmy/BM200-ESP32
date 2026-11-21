@@ -5,6 +5,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <string>
+#ifndef ESP_ARDUINO_VERSION_MAJOR
+#define ESP_ARDUINO_VERSION_MAJOR 4
+#endif
 
 using String = std::string;
 static uint32_t fakeNow = 0;
@@ -31,6 +34,7 @@ constexpr uint32_t WIFI_FALLBACK_AFTER_MS = 12000;
 constexpr uint32_t WIFI_AP_RETRY_INTERVAL_MS = 30000;
 constexpr uint32_t WIFI_AP_HOME_RETRY_INTERVAL_MS = 15UL * 60UL * 1000UL;
 constexpr uint32_t WIFI_AP_IDLE_BEFORE_RETRY_MS = 2UL * 60UL * 1000UL;
+constexpr bool WIFI_DISABLE_WPA3_RSN_OVERRIDE = true;
 const char* WIFI_HOSTNAME = "test";
 const char* WIFI_STA_SSID = "test";
 const char* WIFI_STA_PASSWORD = "TEST_PASS";
@@ -50,6 +54,9 @@ struct WiFiMock {
     int staStatus = WL_DISCONNECTED;
     unsigned clientCount = 0;
     unsigned beginCalls = 0;
+    unsigned explicitConnectCalls = 0;
+    bool rsnCompatDisabled = false;
+    bool lastBeginWasDeferred = false;
     unsigned softAPCalls = 0;
     void persistent(bool) {}
     template<class Callback> void onEvent(Callback, int) {}
@@ -58,7 +65,11 @@ struct WiFiMock {
     void setAutoReconnect(bool) {}
     bool disconnect(bool, bool) { staStatus=WL_DISCONNECTED; return true; }
     int status() const { return staStatus; }
-    void begin(const char*, const char*) { ++beginCalls; staStatus=allowConnect ? WL_CONNECTED : WL_DISCONNECTED; }
+    void begin(const char*, const char*, int=0, const uint8_t* =nullptr, bool connect=true) {
+        ++beginCalls;
+        lastBeginWasDeferred = !connect;
+        staStatus = connect && allowConnect ? WL_CONNECTED : WL_DISCONNECTED;
+    }
     bool softAPConfig(IPAddress,IPAddress,IPAddress) { return true; }
     bool softAP(const char*,const char*,int,bool,int) { ap=true; ++softAPCalls; return true; }
     bool softAPdisconnect(bool) { ap=false; return true; }
@@ -67,6 +78,26 @@ struct WiFiMock {
     unsigned softAPgetStationNum() const { return clientCount; }
     int RSSI() const { return -55; }
 } WiFi;
+#if ESP_ARDUINO_VERSION_MAJOR >= 4
+using esp_err_t = int;
+constexpr esp_err_t ESP_OK = 0;
+constexpr int WIFI_IF_STA = 0;
+struct wifi_config_t { struct { uint32_t disable_wpa3_compatible_mode = 0; } sta; };
+const char* esp_err_to_name(esp_err_t) { return "ESP_OK"; }
+esp_err_t esp_wifi_get_config(int, wifi_config_t* cfg) {
+    *cfg = wifi_config_t{};
+    return ESP_OK;
+}
+esp_err_t esp_wifi_set_config(int, const wifi_config_t* cfg) {
+    WiFi.rsnCompatDisabled = cfg->sta.disable_wpa3_compatible_mode != 0;
+    return ESP_OK;
+}
+esp_err_t esp_wifi_connect() {
+    ++WiFi.explicitConnectCalls;
+    WiFi.staStatus = WiFi.allowConnect ? WL_CONNECTED : WL_DISCONNECTED;
+    return ESP_OK;
+}
+#endif
 struct WebMock { bool started=false; int starts=0, stops=0; void begin() {started=true; ++starts;} void stop(){started=false; ++stops;} } web;
 struct MdnsMock { bool begin(const char*) {return true;} void addService(const char*,const char*,int) {} void end() {} } MDNS;
 void ramCheckpoint(const char*) {}
@@ -105,6 +136,9 @@ int main() {
     initWiFi(); ensureNetworkHttp(); maintainWiFi();
     assert(WiFi.getMode()==WIFI_STA && !apActive && httpServerStarted && web.starts==1);
     assert(mdnsActive && WiFi.beginCalls==1);
+#if ESP_ARDUINO_VERSION_MAJOR >= 4
+    assert(WiFi.lastBeginWasDeferred && WiFi.rsnCompatDisabled && WiFi.explicitConnectCalls==1);
+#endif
 
     // No WLAN at boot: switch completely to AP-only, start HTTP afterward.
     resetState(); initWiFi();
@@ -122,6 +156,9 @@ int main() {
     maintainWiFi(); ensureNetworkHttp(); maintainWiFi();
     assert(!apActive && WiFi.getMode()==WIFI_STA && httpServerStarted);
     assert(WiFi.beginCalls==2);
+#if ESP_ARDUINO_VERSION_MAJOR >= 4
+    assert(WiFi.rsnCompatDisabled && WiFi.explicitConnectCalls==2);
+#endif
 
     // BOOT 5s switches home -> forced AP, then AP -> home.
     resetState(); WiFi.allowConnect=true;
@@ -137,13 +174,20 @@ int main() {
     maintainWiFiButton(); ensureNetworkHttp(); maintainWiFi();
     assert(!forcedAPMode && !apActive && WiFi.getMode()==WIFI_STA);
     assert(httpServerStarted && WiFi.beginCalls==2);
+#if ESP_ARDUINO_VERSION_MAJOR >= 4
+    assert(WiFi.rsnCompatDisabled && WiFi.explicitConnectCalls==2);
+#endif
 
     // A dropped established STA link gets 12 seconds to recover, not 20.
     resetState(); WiFi.allowConnect=true;
     initWiFi(); ensureNetworkHttp(); maintainWiFi();
+    WiFi.allowConnect=false; // Simulate an actual unavailable home network.
     WiFi.staStatus=WL_DISCONNECTED;
     maintainWiFi();
     assert(wifiRecoveringAfterLoss && !httpServerStarted);
+#if ESP_ARDUINO_VERSION_MAJOR >= 4
+    assert(WiFi.explicitConnectCalls==2); // Initial connect + one bounded retry.
+#endif
     fakeNow+=WIFI_FALLBACK_AFTER_MS-100;
     maintainWiFi(); assert(!apActive);
     fakeNow+=100;

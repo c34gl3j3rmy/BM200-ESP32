@@ -50,6 +50,45 @@ void startFallbackAP() {
     // The HTTP server starts only after the AP network is ready, in setup/loop.
 }
 
+// Core 4.x (ESP-IDF 6.x): on Freebox WPA2/3 Compatible Mode,
+// the newer driver can fail the RSN Override (WPA3) handshake (reason 17).
+// The minimal diagnostic confirmed that disabling only this ESP32 feature
+// permits a successful WPA2-AES connection without changing router settings.
+// Core 3.x retains the previously working standard Arduino WiFi.begin().
+bool beginHomeSTAConnection() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 4
+    WiFi.setAutoReconnect(false); // Network transitions are managed by loop().
+
+    // Prepare credentials, but do not start the WPA handshake yet.
+    WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD, 0, nullptr, false);
+
+    wifi_config_t cfg = {};
+    esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &cfg);
+    if (err != ESP_OK) {
+        addLog("ERROR", "Wi-Fi Core4: get_config: %s", esp_err_to_name(err));
+        return false;
+    }
+    cfg.sta.disable_wpa3_compatible_mode = WIFI_DISABLE_WPA3_RSN_OVERRIDE ? 1 : 0;
+    err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (err != ESP_OK) {
+        addLog("ERROR", "Wi-Fi Core4: set_config: %s", esp_err_to_name(err));
+        return false;
+    }
+    addLog("INFO", "Wi-Fi Core4: RSN Override %s cote ESP32",
+           WIFI_DISABLE_WPA3_RSN_OVERRIDE ? "desactive (WPA2)" : "autorise");
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        addLog("ERROR", "Wi-Fi Core4: connect: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
+#else
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD);
+    return true;
+#endif
+}
+
 void startHomeSTA(const char* reason) {
     stopNetworkHttp();
     stopNetworkMdns();
@@ -59,13 +98,12 @@ void startHomeSTA(const char* reason) {
     }
     forcedAPMode = false;
     WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
     wifiAttemptStartedAt = millis();
     staAttemptRunning = true;
     wifiRecoveringAfterLoss = false;
     previousSTAConnected = false;
     lastAPAttempt = 0;
-    WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD);
+    beginHomeSTAConnection();
     addLog("INFO", "Wi-Fi STA: connexion a %s (%s)", WIFI_STA_SSID,
            reason ? reason : "inconnu");
 }
@@ -144,7 +182,7 @@ void initWiFi() {
     // Preserve the successful HelloServer / V1.5.1 startup sequence.
     // No AP, no BLE and no WebServer yet while joining the home Wi-Fi.
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD);
+    beginHomeSTAConnection();
     wifiAttemptStartedAt = millis();
     staAttemptRunning = true;
     wifiRecoveringAfterLoss = false;
@@ -226,6 +264,14 @@ void maintainWiFi() {
         wifiAttemptStartedAt = now;
         stopNetworkHttp();
         stopNetworkMdns();
+#if ESP_ARDUINO_VERSION_MAJOR >= 4
+        // Core 4 uses manual reconnection (auto reconnect is intentionally off).
+        // Try exactly once; never issue repeated esp_wifi_connect() calls.
+        const esp_err_t retryErr = esp_wifi_connect();
+        addLog(retryErr == ESP_OK ? "INFO" : "WARN",
+               "Wi-Fi Core4: tentative unique de reconnexion: %s",
+               esp_err_to_name(retryErr));
+#endif
         addLog("WARN", "Wi-Fi domestique perdu: attente %lu s avant secours",
                static_cast<unsigned long>(WIFI_FALLBACK_AFTER_MS / 1000));
     }
