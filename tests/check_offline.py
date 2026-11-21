@@ -46,20 +46,42 @@ for token in ['WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD)', 'WiFi.softAP(',
 assert 'Secrets.h' in (ROOT / '.gitignore').read_text()
 print("Wi-Fi fallback and secret management: OK")
 
-# Espressif requires hostname configuration before WiFi.mode/start.
-assert firmware.index('WiFi.setHostname(WIFI_HOSTNAME)') < firmware.index('WiFi.mode(WIFI_STA);')
-# Do not disclose secrets in public firmware, config or documentation.
+# STA is established before the HTTP listener; AP fallback is AP-only.
+wifi_source = (ROOT / 'WiFiModule.h').read_text()
+ino_source = (ROOT / 'BM200_ESP32.ino').read_text()
+config_source = (ROOT / 'Config.h').read_text()
+assert 'WIFI_STA_FIRST_DIAGNOSTIC' not in config_source
+assert 'WiFi.mode(WIFI_STA);' in wifi_source
+assert 'WiFi.mode(WIFI_AP);' in wifi_source
+assert 'WiFi.mode(WIFI_AP_STA)' not in wifi_source
+assert '    WiFi.reconnect();' not in wifi_source
+assert 'ensureNetworkHttp()' in wifi_source
+assert 'registerRoutes();' in ino_source
+assert ino_source.index('registerRoutes();') < ino_source.index('ensureNetworkHttp();')
+assert 'LittleFS.begin(ALLOW_LITTLEFS_AUTOFORMAT)' in ino_source
+assert 'ALLOW_LITTLEFS_AUTOFORMAT = false' in config_source
+assert 'WIFI_AP_HOME_RETRY_INTERVAL_MS' in wifi_source
+assert 'WiFi.softAPgetStationNum()' in wifi_source
+
+# Never disclose actual credentials in public firmware/configuration/documentation.
 secrets_file = ROOT / 'Secrets.h'
 secrets = (secrets_file if secrets_file.exists() else ROOT / 'Secrets.example.h').read_text()
 secret_values = re.findall(r'WIFI_(?:STA|AP)_PASSWORD\s*=\s*"([^"]+)"', secrets)
 assert len(secret_values) == 2
 for secret in secret_values:
     assert len(secret) >= 8
+    if not secrets_file.exists():
+        continue  # The public example values are necessarily visible.
     for public_path in ['README.md','Config.h','Secrets.example.h'] + [x.name for x in [ROOT / 'BM200_ESP32.ino', *ROOT.glob('*Module.h')]]:
-        if public_path == 'Secrets.example.h' and not secrets_file.exists():
-            continue
         assert secret not in (ROOT / public_path).read_text(), f"secret found in {public_path}"
-print("Hostname order and credential isolation: OK")
+print("Sequential Wi-Fi, LittleFS protection and credentials: OK")
+
+# Compile the actual network module against independent Arduino API mocks.
+mock_bin = TESTS / "_wifi_state_machine_bin"
+run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
+     str(TESTS / "wifi_state_machine_test.cpp"), "-o", str(mock_bin)])
+print(run([str(mock_bin)]).stdout.decode().strip())
+mock_bin.unlink(missing_ok=True)
 
 # Prevent reintroducing a dependency on internal NimBLE host include paths.
 assert "#include <host/ble_hs.h>" not in firmware

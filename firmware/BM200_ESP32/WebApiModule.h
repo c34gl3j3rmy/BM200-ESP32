@@ -458,6 +458,11 @@ void registerRoutes() {
         dontCache();
         web.send(200,"text/html; charset=utf-8","<!doctype html><meta name=viewport content='width=device-width'><title>BM200 API</title><h2>BM200 - ESP32 API</h2><p>Interface: installer la PWA depuis GitHub Pages.</p><p><a href='/api/status'>Etat JSON</a> | <a href='/api/logs'>Journal</a></p>");
     });
+    // Diagnostic minimal : verifier la reponse du serveur sans allouer de gros JSON.
+    web.on("/api/ping", HTTP_GET, []() {
+        Serial.println("[HTTP] GET /api/ping");
+        web.send(200, "text/plain", "PONG");
+    });
     web.on("/api/status", HTTP_GET, sendStatus);
     web.on("/api/logs", HTTP_GET, sendLogs);
     web.on("/api/preview", HTTP_GET, sendPreview);

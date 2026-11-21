@@ -1,7 +1,7 @@
 /*
- * ANCEL BM200 - Standalone BLE to Wi-Fi gateway - version V1.5.0 (PSA Crypto / ESP32 core 4.x).
+ * ANCEL BM200 - BLE to Wi-Fi gateway V1.5.2 STA-first with AP-only fallback.
  * Board: ESP32-WROOM-32 / ESP32 Dev Module (classic ESP32).
- * Arduino ESP32 core 4.0.0 and NimBLE-Arduino 2.5.x.
+ * Arduino ESP32 cores 3.3.13 / 4.0.0 and NimBLE-Arduino 2.5.x.
  *
  * Read-only requests backed by captured protocol evidence: live D1 55 07, history D1 55 05, startup report D1 55 03.
  * No GPS, alarm configuration, charge tests or parameter writes.
@@ -143,12 +143,15 @@ uint32_t ramLastCheckpointMs = 0;
 
 // Network management in loop(): do not reboot the BLE stack when Wi-Fi changes.
 bool apActive = false;
+bool httpServerStarted = false;
 bool mdnsActive = false;
 bool previousSTAConnected = false;
-uint32_t wifiDisconnectedSince = 0;
-uint32_t lastWiFiRetry = 0;
-uint32_t staConnectedSince = 0;
+uint32_t wifiAttemptStartedAt = 0;
+uint32_t apStartedAt = 0;
+uint32_t apLastClientSeenAt = 0;
 uint32_t lastAPAttempt = 0;
+bool staAttemptRunning = false;
+bool wifiRecoveringAfterLoss = false;
 bool forcedAPMode = false;
 bool io0Pressed = false;
 bool io0Handled = false;
@@ -204,7 +207,10 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(250);
     Serial.println();
-    Serial.println("==== ANCEL BM200 ESP32 Wi-Fi Gateway V1.4.3 ====");
+    Serial.println("==== ANCEL BM200 ESP32 Wi-Fi Gateway V1.5.2 STA+AP ====");
+    Serial.printf("[BOOT] Arduino ESP32 Core %d.%d.%d\n",
+                  ESP_ARDUINO_VERSION_MAJOR, ESP_ARDUINO_VERSION_MINOR,
+                  ESP_ARDUINO_VERSION_PATCH);
     statusMutex = xSemaphoreCreateMutex();
     logsMutex = xSemaphoreCreateMutex();
     blePackets = xQueueCreate(BLE_QUEUE_DEPTH, sizeof(BlePacket));
@@ -232,8 +238,9 @@ void setup() {
     }
     interruptedSyncMarker = 0;
 
-    // First boot may format an empty LittleFS partition.
-    fsReady = LittleFS.begin(true);
+    // Protect existing measurements when changing Arduino core versions.
+    // Never format LittleFS automatically on a failed mount.
+    fsReady = LittleFS.begin(ALLOW_LITTLEFS_AUTOFORMAT);
     addLog(fsReady ? "INFO" : "ERROR", "LittleFS: %s", fsReady ? "monte" : "echec du montage");
     if (fsReady) {
         LittleFS.remove(PATH_HISTORY_TEMP);
@@ -263,15 +270,17 @@ void setup() {
 
     ramCheckpoint("avant_serveur_web");
     registerRoutes();
-    web.begin();
-    addLog("INFO", "Serveur Web disponible sur port 80");
+    ensureNetworkHttp();
+    if (!httpServerStarted) {
+        addLog("WARN", "Serveur HTTP en attente du reseau Wi-Fi");
+    }
     ramCheckpoint("serveur_web_actif");
 
     if (!initBm200Crypto()) {
-        addLog("ERROR", "Chiffrement PSA AES indisponible ; BLE non demarre");
+        addLog("ERROR", "Chiffrement AES indisponible ; BLE non demarre");
         return;
     }
-    addLog("INFO", "Chiffrement PSA AES-128 pret");
+    addLog("INFO", "Chiffrement AES-128 pret (PSA Core4 / mbedTLS Core3)");
 
     if (!initializeBleEngine("demarrage")) {
         addLog("ERROR", "BLE indisponible au demarrage; utiliser 'Forcer reconnexion' apres correction/reessai");
@@ -279,9 +288,19 @@ void setup() {
 }
 
 void loop() {
+    // 30-second heartbeat for network diagnosis and RAM monitoring.
+    static uint32_t diagLast = 0;
+    if (millis() - diagLast >= 30000) {
+        diagLast = millis();
+        Serial.printf("[DIAG] loop actif, mode=%d, AP clients=%u, HTTP=handleClient, RAM=%u\n",
+                      static_cast<int>(WiFi.getMode()),
+                      static_cast<unsigned>(WiFi.softAPgetStationNum()),
+                      static_cast<unsigned>(ESP.getFreeHeap()));
+    }
     maintainWiFiButton();
     maintainWiFi();
+    ensureNetworkHttp();
     maintainStatusLed();
-    web.handleClient();
-    delay(5);
+    if (httpServerStarted) web.handleClient();
+    delay(2); // Same scheduling as the official HelloServer example.
 }

@@ -1,33 +1,74 @@
 #pragma once
 
+// Lifecycle: connect STA before HTTP, switch to AP-only on timeout.
+// Do not run WiFi.reconnect() while the AP is serving clients.
+// Only setup()/loop() modify the network state (no Wi-Fi operations in callbacks).
+
+void stopNetworkHttp() {
+    if (!httpServerStarted) return;
+    web.stop();
+    httpServerStarted = false;
+    addLog("DEBUG", "HTTP: arret du serveur avant changement de reseau");
+}
+
+void stopNetworkMdns() {
+    if (!mdnsActive) return;
+    MDNS.end();
+    mdnsActive = false;
+}
+
 void startFallbackAP() {
     if (apActive) return;
-    WiFi.mode(WIFI_AP_STA); // Keep retrying the home network in parallel.
+    stopNetworkHttp();
+    stopNetworkMdns();
+
+    // Completely leave station mode. Never keep a pending STA connection
+    // active while the emergency access point is serving HTTP requests.
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(true, false);
+    WiFi.mode(WIFI_AP);
     const IPAddress ip(192, 168, 4, 1);
     if (!WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0))) {
-        addLog("WARN", "Configuration IP du point d'acces de secours refusee");
+        addLog("WARN", "Wi-Fi secours: configuration IP refusee");
     }
     ramCheckpoint("avant_wifi_secours");
-    if (WiFi.softAP(WIFI_AP_NAME, WIFI_AP_PASSWORD, 1, false, 2)) {
-        apActive = true;
-        ramCheckpoint("wifi_secours_actif");
-        addLog("INFO", "Secours Wi-Fi actif: SSID %s, URL http://%s", WIFI_AP_NAME,
-               WiFi.softAPIP().toString().c_str());
-    } else {
-        addLog("ERROR", "Impossible de demarrer le point d'acces de secours");
-    }
-}
-
-void stopFallbackAP() {
-    if (!apActive) return;
-    if (!WiFi.softAPdisconnect(true)) {
-        addLog("WARN", "Arret du point d'acces de secours refuse");
+    if (!WiFi.softAP(WIFI_AP_NAME, WIFI_AP_PASSWORD, 1, false, 2)) {
+        apActive = false;
+        addLog("ERROR", "Wi-Fi secours: creation AP impossible; nouvel essai plus tard");
         return;
     }
-    apActive = false;
-    addLog("INFO", "Secours Wi-Fi arrete: acces via le reseau domestique");
+    apActive = true;
+    staAttemptRunning = false;
+    wifiRecoveringAfterLoss = false;
+    previousSTAConnected = false;
+    apStartedAt = millis();
+    apLastClientSeenAt = apStartedAt;
+    ramCheckpoint("wifi_secours_actif");
+    addLog("INFO", "Wi-Fi secours AP seul: %s, IP http://%s, mode=%d",
+           WIFI_AP_NAME, WiFi.softAPIP().toString().c_str(),
+           static_cast<int>(WiFi.getMode()));
+    // The HTTP server starts only after the AP network is ready, in setup/loop.
 }
 
+void startHomeSTA(const char* reason) {
+    stopNetworkHttp();
+    stopNetworkMdns();
+    if (apActive) {
+        WiFi.softAPdisconnect(true);
+        apActive = false;
+    }
+    forcedAPMode = false;
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    wifiAttemptStartedAt = millis();
+    staAttemptRunning = true;
+    wifiRecoveringAfterLoss = false;
+    previousSTAConnected = false;
+    lastAPAttempt = 0;
+    WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD);
+    addLog("INFO", "Wi-Fi STA: connexion a %s (%s)", WIFI_STA_SSID,
+           reason ? reason : "inconnu");
+}
 
 void setStatusLed(bool on) {
     if (!STATUS_LED_ENABLED) return;
@@ -36,26 +77,17 @@ void setStatusLed(bool on) {
 }
 
 void enterForcedAPMode() {
-    if (forcedAPMode) return;
+    if (apActive) return;
     forcedAPMode = true;
-    WiFi.setAutoReconnect(false);
-    if (mdnsActive) { MDNS.end(); mdnsActive = false; }
-    WiFi.disconnect(false, false);
-    previousSTAConnected = false;
+    lastAPAttempt = millis();
     startFallbackAP();
-    addLog("INFO", "IO0: mode secours force active; ouvrir http://192.168.4.1");
+    addLog("INFO", "IO0: secours AP force; ouvrir http://192.168.4.1/api/ping");
     ramCheckpoint("wifi_secours_force");
 }
 
 void leaveForcedAPMode() {
-    if (!forcedAPMode) return;
-    forcedAPMode = false;
-    WiFi.setAutoReconnect(true);
-    WiFi.mode(apActive ? WIFI_AP_STA : WIFI_STA);
-    wifiDisconnectedSince = millis();
-    lastWiFiRetry = millis();
-    WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD);
-    addLog("INFO", "IO0: retour au mode Wi-Fi maison automatique");
+    if (!apActive) return;
+    startHomeSTA("IO0: nouvel essai manuel");
     ramCheckpoint("wifi_retour_maison");
 }
 
@@ -69,7 +101,7 @@ void maintainWiFiButton() {
     }
     if (pressed && !io0Handled && now - io0PressedSince >= WIFI_MODE_BUTTON_HOLD_MS) {
         io0Handled = true;
-        if (forcedAPMode) leaveForcedAPMode();
+        if (apActive) leaveForcedAPMode();
         else enterForcedAPMode();
     }
     if (!pressed && io0Pressed) {
@@ -81,7 +113,7 @@ void maintainWiFiButton() {
 void maintainStatusLed() {
     if (!STATUS_LED_ENABLED) return;
     const uint32_t now = millis();
-    if (forcedAPMode || (apActive && WiFi.status() != WL_CONNECTED)) {
+    if (apActive) {
         if (now - ledLastToggle >= STATUS_LED_SLOW_MS) {
             ledLastToggle = now;
             setStatusLed(!ledLogicalOn);
@@ -99,75 +131,111 @@ void maintainStatusLed() {
 }
 
 void initWiFi() {
-    WiFi.persistent(false); // Avoid storing credentials in Wi-Fi NVS.
-    // Espressif requires setHostname before WiFi.mode() or WiFi.begin().
-    if (!WiFi.setHostname(WIFI_HOSTNAME))
-        addLog("WARN", "Nom d'hote Wi-Fi refuse; l'adresse IP reste utilisable");
+    WiFi.persistent(false);
+    // AP connection notifications are informative only. They run in a
+    // separate Wi-Fi task: do not change WebServer/WiFi state in callbacks.
     WiFi.onEvent([](arduino_event_id_t) {
-        addLog("INFO", "Wi-Fi secours: client connecte, %u client(s) connecte(s)",
-               static_cast<unsigned>(WiFi.softAPgetStationNum()));
+        Serial.println("[WIFI] Client connecte au point d'acces");
     }, ARDUINO_EVENT_WIFI_AP_STACONNECTED);
     WiFi.onEvent([](arduino_event_id_t) {
-        addLog("INFO", "Wi-Fi secours: client deconnecte, %u client(s) connecte(s)",
-               static_cast<unsigned>(WiFi.softAPgetStationNum()));
+        Serial.println("[WIFI] Client deconnecte du point d'acces");
     }, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+
+    // Preserve the successful HelloServer / V1.5.1 startup sequence.
+    // No AP, no BLE and no WebServer yet while joining the home Wi-Fi.
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false); // Keep the V1 BLE/Wi-Fi coexistence behavior.
-    WiFi.setAutoReconnect(true);
-    wifiDisconnectedSince = millis();
-    lastWiFiRetry = millis();
     WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD);
-    addLog("INFO", "Connexion Wi-Fi domestique en cours: %s (2,4 GHz)", WIFI_STA_SSID);
-    addLog("INFO", "En absence de Wi-Fi domestique, secours %s apres %lu s", WIFI_AP_NAME,
-           static_cast<unsigned long>(WIFI_FALLBACK_AFTER_MS / 1000));
+    wifiAttemptStartedAt = millis();
+    staAttemptRunning = true;
+    wifiRecoveringAfterLoss = false;
+    addLog("INFO", "Wi-Fi STA prioritaire: connexion a %s", WIFI_STA_SSID);
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - wifiAttemptStartedAt < WIFI_STA_BOOT_TIMEOUT_MS) {
+        delay(500);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        staAttemptRunning = false;
+        addLog("INFO", "Wi-Fi maison connecte: http://%s/api/status, RSSI %ld dBm",
+               WiFi.localIP().toString().c_str(), static_cast<long>(WiFi.RSSI()));
+    } else {
+        addLog("WARN", "Wi-Fi maison indisponible apres %lu s; activation du secours AP seul",
+               static_cast<unsigned long>(WIFI_STA_BOOT_TIMEOUT_MS / 1000));
+        lastAPAttempt = millis();
+        startFallbackAP();
+    }
+}
+
+// Called by setup()/loop() only after registerRoutes() has run.
+void ensureNetworkHttp() {
+    const bool ready = apActive || WiFi.status() == WL_CONNECTED;
+    if (ready && !httpServerStarted) {
+        web.begin();
+        httpServerStarted = true;
+        addLog("INFO", "Serveur HTTP demarre sur %s port 80",
+               apActive ? "AP" : "STA");
+    } else if (!ready && httpServerStarted) {
+        stopNetworkHttp();
+    }
 }
 
 void maintainWiFi() {
     const uint32_t now = millis();
+    if (apActive) {
+        const uint32_t clients = WiFi.softAPgetStationNum();
+        if (clients != 0) apLastClientSeenAt = now;
+        // Automatic return to the home WLAN is only attempted with no AP
+        // clients, and never while the user has explicitly forced AP mode.
+        if (!forcedAPMode && clients == 0 &&
+            now - apStartedAt >= WIFI_AP_HOME_RETRY_INTERVAL_MS &&
+            now - apLastClientSeenAt >= WIFI_AP_IDLE_BEFORE_RETRY_MS) {
+            addLog("INFO", "Wi-Fi secours sans client: recherche du reseau maison");
+            startHomeSTA("essai automatique apres secours");
+        }
+        return;
+    }
+
     if (forcedAPMode) {
-        if (!apActive) startFallbackAP();
+        // If softAP previously failed, retry it without attempting STA.
+        if (lastAPAttempt == 0 || now - lastAPAttempt >= WIFI_AP_RETRY_INTERVAL_MS) {
+            lastAPAttempt = now;
+            startFallbackAP();
+        }
         return;
     }
+
     const bool connected = WiFi.status() == WL_CONNECTED;
-    if (connected != previousSTAConnected) {
-        previousSTAConnected = connected;
-        if (connected) {
-            staConnectedSince = now;
-            ramCheckpoint("wifi_maison_connecte");
-            const String ip = WiFi.localIP().toString();
-            addLog("INFO", "Wi-Fi %s connecte, adresse http://%s, RSSI %ld dBm",
-                   WIFI_STA_SSID, ip.c_str(), static_cast<long>(WiFi.RSSI()));
-            if (MDNS.begin(WIFI_HOSTNAME)) {
-                MDNS.addService("http", "tcp", 80);
-                mdnsActive = true;
-                addLog("INFO", "mDNS disponible (selon appareils): http://%s.local", WIFI_HOSTNAME);
-            } else {
-                addLog("WARN", "mDNS indisponible; utiliser l'adresse IP du routeur");
-            }
-        } else {
-            if (mdnsActive) { MDNS.end(); mdnsActive = false; }
-            wifiDisconnectedSince = now;
-            ramCheckpoint("wifi_maison_deconnecte");
-            addLog("WARN", "Connexion au Wi-Fi domestique perdue; reconnexion automatique");
-        }
-    }
     if (connected) {
-        if (apActive && now - staConnectedSince >= WIFI_AP_CLOSE_DELAY_MS &&
-            WiFi.softAPgetStationNum() == 0) {
-            stopFallbackAP(); // Never interrupt an active fallback client.
+        if (!previousSTAConnected) {
+            previousSTAConnected = true;
+            staAttemptRunning = false;
+            wifiRecoveringAfterLoss = false;
+            addLog("INFO", "Wi-Fi maison actif: http://%s/api/status, RSSI %ld dBm",
+                   WiFi.localIP().toString().c_str(), static_cast<long>(WiFi.RSSI()));
+        }
+        if (!mdnsActive && MDNS.begin(WIFI_HOSTNAME)) {
+            MDNS.addService("http", "tcp", 80);
+            mdnsActive = true;
         }
         return;
     }
-    if (!apActive && now - wifiDisconnectedSince >= WIFI_FALLBACK_AFTER_MS &&
+
+    if (previousSTAConnected) {
+        previousSTAConnected = false;
+        staAttemptRunning = true;
+        wifiRecoveringAfterLoss = true;
+        wifiAttemptStartedAt = now;
+        stopNetworkHttp();
+        stopNetworkMdns();
+        addLog("WARN", "Wi-Fi domestique perdu: attente %lu s avant secours",
+               static_cast<unsigned long>(WIFI_FALLBACK_AFTER_MS / 1000));
+    }
+    const uint32_t timeout = wifiRecoveringAfterLoss
+        ? WIFI_FALLBACK_AFTER_MS : WIFI_STA_BOOT_TIMEOUT_MS;
+    if (now - wifiAttemptStartedAt >= timeout &&
         (lastAPAttempt == 0 || now - lastAPAttempt >= WIFI_AP_RETRY_INTERVAL_MS)) {
         lastAPAttempt = now;
         startFallbackAP();
     }
-    if (now - lastWiFiRetry >= WIFI_RETRY_INTERVAL_MS) {
-        lastWiFiRetry = now;
-        addLog("DEBUG", "Nouvelle tentative de connexion au Wi-Fi %s", WIFI_STA_SSID);
-        WiFi.reconnect();
-    }
 }
 
-// HTTP helpers. Accessible on the home LAN or on the fallback AP.
+// HTTP helpers. Accessible from the home WLAN or from the fallback AP.
