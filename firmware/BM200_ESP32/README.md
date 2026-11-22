@@ -1,17 +1,11 @@
-# Firmware BM200 - V1.5.4 (portail captif + NVS)
-
-Le firmware de ce ZIP comprend le Wi-Fi en AP seul, l'option WPA2/3 Core4 et un portail captif DNS/HTTP. Lire `../../00_LIRE_EN_PREMIER.md` avant de televerser. Les notes ci-dessous sont celles de la version de base et peuvent decrire des comportements historiques.
-
----
-
-# BM200 / ESP32 - V1.5.0 (version expérimentale)
+# BM200 / ESP32 - V1.5.2 (version expérimentale)
 
 Projet Arduino a nom fixe : `BM200_ESP32/BM200_ESP32.ino`.
 
 ## Installation (Arduino IDE 2.3.x)
 
 1. Decompresser l'archive dans un emplacement fixe. Ouvrir `BM200_ESP32.ino`.
-2. Aucun `Secrets.h` requis : configuration initiale depuis le portail captif, puis validation physique IO0 durant 2 secondes.
+2. Aucun fichier `Secrets.h` requis. Premiere configuration : connecter le telephone au point d'acces ouvert `BM200-ESP32`, puis ouvrir `http://192.168.4.1/`. Maintenir BOOT 5 a moins de 30 s, puis relacher pour autoriser la saisie des Wi-Fi dans les 10 minutes.
 3. Carte : **ESP32 Dev Module**. Port : celui de votre adaptateur CP210x (precedemment COM3).
 4. Core : **esp32 by Espressif Systems 4.0.0** ; bibliotheque **NimBLE-Arduino 2.5.2**.
 5. Outils > Partition Scheme : **Huge APP (3MB No OTA/1MB SPIFFS)**.
@@ -30,7 +24,7 @@ Il n'y a pas de firmware precompile dans ce ZIP. La compilation reelle Arduino e
 - **Nouveau** : interface inspiree de la capture ANCEL, jauge SoC, tension, temperature, indicateurs Wi-Fi/BLE/RAM.
 - **Nouveau** : diagnostic memoire (heap libre, minimum, plus gros bloc) aux jalons BLE/Wi-Fi et environ toutes les 15 s en Live. CSV disponible sous `/download/ram.csv` (rotation a 64 Kio). Traces serie + journal RAM recent accessible sous `/api/logs`.
 - **Nouveau** : si l'historique principal comporte plus de lignes que le transfert actuel, le transfert plus court est conserve dans `/download/short.csv` et `/download/short.json` sans remplacer l'historique principal.
-- IO0 : maintenir 2 secondes pour confirmer une configuration en attente ; maintenir 5 secondes sans configuration en attente pour changer le mode Wi-Fi.
+- **Bouton BOOT / IO0 :** relacher entre 5 et moins de 30 s pour basculer le mode Wi-Fi et autoriser les reglages 10 min ; relacher entre 30 et moins de 60 s pour effacer uniquement le mot de passe Wi-Fi direct ; a partir de 60 s, aucune action.
 
 ## Ce qui n'est PAS encore implemente
 
@@ -69,7 +63,7 @@ Dans un environnement disposant de g++, OpenSSL, Node et Python : `python tests/
 
 - `BM200_ESP32.ino` est ramené sous 400 lignes.
 - Le firmware est séparé en onglets Arduino: diagnostics, BLE coeur, synchronisation, live, Wi-Fi et API Web.
-- Un appui long de 5 secondes sur IO0 bascule entre le mode Wi-Fi automatique et le point d'accès de secours forcé.
+- Un appui sur BOOT de 5 a moins de 30 secondes (puis relachement) bascule entre le mode Wi-Fi automatique et le point d'acces force ; entre 30 et moins de 60 secondes, seul le mot de passe Wi-Fi direct est efface ; a partir de 60 secondes, aucune action.
 - GPIO2 est utilisé comme LED d'état candidate sur NodeMCU ESP-32S V1.1: fixe en Wi-Fi maison, clignotement lent en secours, rapide pendant la connexion.
 - La jauge mobile est redimensionnée pour ne plus chevaucher tension et température.
 - Le protocole BLE historique reste inchangé par rapport à V1.3.0.
@@ -107,7 +101,10 @@ La structure est fondee sur l'audit APK/HCI V11 et les captures reelles. Le chem
 La page `WebPage.h` est retirée du firmware. Le répertoire `web/` à la racine du dépôt contient désormais l’interface. La route `/api/history.bin` transmet les mots historiques bruts déchiffrés, sans créer de grand JSON en RAM, et `/api/logs` envoie les lignes progressivement. Le backend conserve ses exports CSV/JSON antérieurs pendant la validation pour éviter toute perte de fonctionnalité.
 Voir `../../README.md` pour la publication et les précautions Chrome Local Network Access.
 
+## V1.5.2 - Wi-Fi sans Secrets.h et bouton BOOT
 
-## Nouvelle configuration V1.5.4
-
-Les valeurs Wi-Fi, BLE et diagnostic sont chargees depuis NVS `Preferences`. Au premier demarrage, le Wi-Fi de secours utilise le mot de passe usine public `BM200-Setup`. Il faut remplacer ce mot de passe pendant la configuration. L'API ne renvoie jamais les mots de passe. La confirmation physique IO0 est obligatoire et une nouvelle connexion Wi-Fi doit etre confirmee dans les 120 secondes pour etre conservee. Le mode Diagnostic complet expire apres 15 minutes. Les traces de paquets BLE ne sont enregistrees qu'au niveau `Complet`.
+- Au premier demarrage sans identifiants en NVS, le point d'acces `BM200-ESP32` demarre ouvert, sans tentative de connexion a un reseau domestique non configure.
+- Configurer les deux reseaux depuis la PWA ou depuis `http://192.168.4.1/` si la PWA n'est pas accessible sans Internet.
+- BOOT : action au **relachement** ; 5-29,999 s = bascule du mode et ouverture des reglages pendant 10 min ; 30-59,999 s = retrait du mot de passe direct dans la NVS ; 60 s et plus = aucune action.
+- Les fichiers historiques LittleFS et les parametres du Wi-Fi domestique ne sont pas effaces lors du retrait du mot de passe direct.
+- Les identifiants en NVS sont conserves lors d'une mise a jour sans effacement complet de la Flash ; pour repartir de zero, il faut une procedure distincte de reset des reglages (non declenchee par BOOT).

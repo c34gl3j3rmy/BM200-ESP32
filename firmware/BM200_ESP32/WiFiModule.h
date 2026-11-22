@@ -1,153 +1,165 @@
 #pragma once
 
-// Lifecycle: connect STA before HTTP, switch to AP-only on timeout.
-// Do not run WiFi.reconnect() while the AP is serving clients.
-// Only setup()/loop() modify the network state (no Wi-Fi operations in callbacks).
-
-void stopNetworkHttp() {
-    if (!httpServerStarted) return;
-    web.stop();
-    httpServerStarted = false;
-    addLog("DEBUG", "HTTP: arret du serveur avant changement de reseau");
-}
-void stopNetworkMdns() {
-    if (!mdnsActive) return;
-    MDNS.end();
-    mdnsActive = false;
+// Credentials are stored in the ESP32 NVS namespace "bm200wifi".
+// A blank AP password means an open point of access, by user choice.
+void initStoredWiFi() {
+    wifiPrefs.begin("bm200wifi", false);
+    homeSSID = wifiPrefs.getString("home_ssid", "");
+    homePassword = wifiPrefs.getString("home_pass", "");
+    accessPointSSID = wifiPrefs.getString("ap_ssid", WIFI_AP_NAME);
+    // Never store a default password in the firmware. First setup: open AP.
+    accessPointPassword = wifiPrefs.getString("ap_pass", "");
+    if (!accessPointSSID.length()) accessPointSSID = WIFI_AP_NAME;
 }
 
-void startFallbackAP() {
-    if (apActive) return;
-    stopNetworkHttp();
-    stopNetworkMdns();
-    // Leave station mode, cancelling pending STA requests before enabling the AP.
-    WiFi.setAutoReconnect(false);
-    WiFi.disconnect(true, false);
-    WiFi.mode(WIFI_AP);
-    const IPAddress ip(192, 168, 4, 1);
-    // Tell DHCP clients to use our DNS: Android can discover the captive portal.
-    if (!WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0),
-                            IPAddress(0, 0, 0, 0), ip)) {
-        addLog("WARN", "Wi-Fi secours: configuration IP refusee");
-    }
-    ramCheckpoint("avant_wifi_secours");
-    if (!WiFi.softAP(WIFI_AP_NAME, WIFI_AP_PASSWORD, 1, false, 2)) {
-        apActive = false;
-        addLog("ERROR", "Wi-Fi secours: creation AP impossible; nouvel essai plus tard");
-        return;
-    }
-    apActive = true;
-    staAttemptRunning = false;
-    wifiRecoveringAfterLoss = false;
-    previousSTAConnected = false;
-    apStartedAt = millis();
-    apLastClientSeenAt = apStartedAt;
-    ramCheckpoint("wifi_secours_actif");
-    addLog("INFO", "Wi-Fi secours AP seul: %s, IP http://%s, mode=%d",
-           WIFI_AP_NAME, WiFi.softAPIP().toString().c_str(),
-           static_cast<int>(WiFi.getMode()));
-    // HTTP is started from setup/loop once the new interface is ready.
+bool wifiSettingsUnlocked() {
+    return settingsUnlockedUntil && static_cast<int32_t>(settingsUnlockedUntil - millis()) > 0;
 }
 
-// Core4 (ESP-IDF 6.x) can fail RSN Override on a WPA2/WPA3 mixed Freebox.
-// Disable only the extra WPA3-compatible RSN negotiation on Core4.
-// Core3 keeps the original WiFi.begin() path.
-bool beginHomeSTAConnection() {
-#if ESP_ARDUINO_VERSION_MAJOR >= 4
-    WiFi.setAutoReconnect(false);
-    WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD, 0, nullptr, false);
-    wifi_config_t cfg = {};
-    esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &cfg);
-    if (err != ESP_OK) {
-        addLog("ERROR", "Wi-Fi Core4: get_config: %s", esp_err_to_name(err));
-        return false;
-    }
-    cfg.sta.disable_wpa3_compatible_mode = WIFI_DISABLE_WPA3_RSN_OVERRIDE ? 1 : 0;
-    err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
-    if (err != ESP_OK) {
-        addLog("ERROR", "Wi-Fi Core4: set_config: %s", esp_err_to_name(err));
-        return false;
-    }
-    addLog("INFO", "Wi-Fi Core4: RSN Override %s cote ESP32",
-           WIFI_DISABLE_WPA3_RSN_OVERRIDE ? "desactive (WPA2)" : "autorise");
-    err = esp_wifi_connect();
-    if (err != ESP_OK) {
-        addLog("ERROR", "Wi-Fi Core4: connect: %s", esp_err_to_name(err));
-        return false;
-    }
-    return true;
-#else
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD);
-    return true;
-#endif
+void unlockWifiSettings() {
+    settingsUnlockedUntil = millis() + WIFI_SETTINGS_WINDOW_MS;
+    addLog("INFO", "Configuration Wi-Fi autorisee pendant 10 minutes (bouton BOOT)");
 }
 
-void startHomeSTA(const char* reason) {
-    stopNetworkHttp();
-    stopNetworkMdns();
+void startFallbackAP();
+
+void restartAccessPoint() {
     if (apActive) {
         WiFi.softAPdisconnect(true);
         apActive = false;
     }
-    forcedAPMode = false;
-    WiFi.mode(WIFI_STA);
-    wifiAttemptStartedAt = millis();
-    staAttemptRunning = true;
-    wifiRecoveringAfterLoss = false;
-    previousSTAConnected = false;
-    lastAPAttempt = 0;
-    beginHomeSTAConnection();
-    addLog("INFO", "Wi-Fi STA: connexion a %s (%s)", WIFI_STA_SSID,
-           reason ? reason : "inconnu");
+    startFallbackAP();
 }
+
+void applyPendingWiFi() {
+    if (!pendingWifiApply || static_cast<int32_t>(millis() - applyWifiAt) < 0) return;
+    uint8_t mode = pendingWifiApply;
+    pendingWifiApply = 0;
+    if (mode == 2) {
+        restartAccessPoint();
+    } else if (mode == 1) {
+        if (mdnsActive) { MDNS.end(); mdnsActive = false; }
+        WiFi.disconnect(false, false);
+        previousSTAConnected = false;
+        wifiDisconnectedSince = millis();
+        lastWiFiRetry = millis();
+        if (!forcedAPMode && homeSSID.length()) {
+            WiFi.mode(apActive ? WIFI_AP_STA : WIFI_STA);
+            WiFi.setAutoReconnect(true);
+            WiFi.begin(homeSSID.c_str(), homePassword.c_str());
+        }
+        startFallbackAP(); // Keep a recovery path if the new home password is wrong.
+    }
+}
+
+void startFallbackAP() {
+    if (apActive) return;
+    // Pure AP mode during initial setup or forced fallback: do not scan STA.
+    WiFi.mode((forcedAPMode || !homeSSID.length()) ? WIFI_AP : WIFI_AP_STA);
+    const IPAddress ip(192, 168, 4, 1);
+    if (!WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0))) {
+        addLog("WARN", "Configuration IP du point d'acces de secours refusee");
+    }
+    ramCheckpoint("avant_wifi_secours");
+    if (WiFi.softAP(accessPointSSID.c_str(), accessPointPassword.length() ? accessPointPassword.c_str() : nullptr, 1, false, 2)) {
+        apActive = true;
+        ramCheckpoint("wifi_secours_actif");
+        addLog("INFO", "Secours Wi-Fi actif: SSID %s, URL http://%s", accessPointSSID.c_str(),
+               WiFi.softAPIP().toString().c_str());
+    } else {
+        addLog("ERROR", "Impossible de demarrer le point d'acces de secours");
+    }
+}
+
+void stopFallbackAP() {
+    if (!apActive) return;
+    if (!WiFi.softAPdisconnect(true)) {
+        addLog("WARN", "Arret du point d'acces de secours refuse");
+        return;
+    }
+    apActive = false;
+    addLog("INFO", "Secours Wi-Fi arrete: acces via le reseau domestique");
+}
+
 
 void setStatusLed(bool on) {
     if (!STATUS_LED_ENABLED) return;
     ledLogicalOn = on;
     digitalWrite(STATUS_LED_PIN, (on == STATUS_LED_ACTIVE_HIGH) ? HIGH : LOW);
 }
+
 void enterForcedAPMode() {
-    if (apActive) return;
+    if (forcedAPMode) return;
     forcedAPMode = true;
-    lastAPAttempt = millis();
+    WiFi.setAutoReconnect(false);
+    if (mdnsActive) { MDNS.end(); mdnsActive = false; }
+    WiFi.disconnect(false, false);
+    previousSTAConnected = false;
     startFallbackAP();
-    addLog("INFO", "IO0: secours AP force; ouvrir http://192.168.4.1/api/ping");
+    addLog("INFO", "IO0: mode secours force active; ouvrir http://192.168.4.1");
     ramCheckpoint("wifi_secours_force");
 }
+
 void leaveForcedAPMode() {
-    if (!apActive || !WIFI_STA_SSID[0]) return;
-    startHomeSTA("IO0: nouvel essai manuel");
+    if (!forcedAPMode) return;
+    forcedAPMode = false;
+    WiFi.setAutoReconnect(homeSSID.length() > 0);
+    if (homeSSID.length()) {
+        WiFi.mode(apActive ? WIFI_AP_STA : WIFI_STA);
+        wifiDisconnectedSince = millis();
+        lastWiFiRetry = millis();
+        WiFi.begin(homeSSID.c_str(), homePassword.c_str());
+        addLog("INFO", "IO0: retour au mode Wi-Fi maison automatique");
+    } else {
+        startFallbackAP();
+        addLog("INFO", "IO0: aucun Wi-Fi maison configure; maintien du point d'acces direct");
+    }
     ramCheckpoint("wifi_retour_maison");
 }
+
 void maintainWiFiButton() {
     const uint32_t now = millis();
     const bool pressed = digitalRead(WIFI_MODE_BUTTON_PIN) == LOW;
     if (pressed && !io0Pressed) {
         io0Pressed = true;
-        io0Handled = false;
         io0PressedSince = now;
-        io0ConfigPressDone = false;
+        return;
     }
-    if (pressed && configPending && !io0ConfigPressDone && now - io0PressedSince >= CONFIG_BUTTON_HOLD_MS) {
-        io0ConfigPressDone = true;
-        io0Handled = true;
-        applyStagedConfigAfterButton();
-    }
-    if (pressed && !configPending && !io0Handled && now - io0PressedSince >= WIFI_MODE_BUTTON_HOLD_MS) {
-        io0Handled = true;
-        if (apActive) leaveForcedAPMode();
-        else enterForcedAPMode();
-    }
-    if (!pressed && io0Pressed) {
-        io0Pressed = false;
-        io0Handled = false;
+    if (pressed || !io0Pressed) return;
+
+    // Act only on release so a 60-second hold cannot accidentally clear Wi-Fi.
+    io0Pressed = false;
+    const uint32_t held = now - io0PressedSince; // unsigned, safe across millis wrap.
+    switch (wifiBootActionForHold(held, WIFI_MODE_BUTTON_HOLD_MS,
+                                  WIFI_AP_RESET_HOLD_MS, WIFI_BOOT_IGNORE_HOLD_MS)) {
+        case WifiBootAction::ToggleAP:
+            unlockWifiSettings();
+            if (forcedAPMode) leaveForcedAPMode();
+            else enterForcedAPMode();
+            addLog("INFO", "BOOT relache apres %lu ms: changement de mode Wi-Fi",
+                   static_cast<unsigned long>(held));
+            break;
+        case WifiBootAction::ClearAPPassword:
+            // Only NVS AP password changes: home Wi-Fi and LittleFS remain intact.
+            wifiPrefs.remove("ap_pass");
+            accessPointPassword = "";
+            unlockWifiSettings();
+            if (!forcedAPMode) enterForcedAPMode();
+            pendingWifiApply = 2;
+            applyWifiAt = now + 300;
+            addLog("WARN", "BOOT relache entre 30 et 59 s: Wi-Fi direct remis en mode ouvert");
+            break;
+        case WifiBootAction::None:
+            if (held >= WIFI_BOOT_IGNORE_HOLD_MS)
+                addLog("INFO", "BOOT >= 60 s: aucune action (securite)");
+            break;
     }
 }
+
 void maintainStatusLed() {
     if (!STATUS_LED_ENABLED) return;
     const uint32_t now = millis();
-    if (apActive) {
+    if (forcedAPMode || (apActive && WiFi.status() != WL_CONNECTED)) {
         if (now - ledLastToggle >= STATUS_LED_SLOW_MS) {
             ledLastToggle = now;
             setStatusLed(!ledLogicalOn);
@@ -163,109 +175,85 @@ void maintainStatusLed() {
         setStatusLed(!ledLogicalOn);
     }
 }
+
 void initWiFi() {
-    WiFi.persistent(false);
-    // Only report clients from callbacks; manage WiFi/WebServer in loop().
+    WiFi.persistent(false); // Avoid storing credentials in Wi-Fi NVS.
+    // Espressif requires setHostname before WiFi.mode() or WiFi.begin().
+    if (!WiFi.setHostname(WIFI_HOSTNAME))
+        addLog("WARN", "Nom d'hote Wi-Fi refuse; l'adresse IP reste utilisable");
     WiFi.onEvent([](arduino_event_id_t) {
-        Serial.println("[WIFI] Client connecte au point d'acces");
+        addLog("INFO", "Wi-Fi secours: client connecte, %u client(s) connecte(s)",
+               static_cast<unsigned>(WiFi.softAPgetStationNum()));
     }, ARDUINO_EVENT_WIFI_AP_STACONNECTED);
     WiFi.onEvent([](arduino_event_id_t) {
-        Serial.println("[WIFI] Client deconnecte du point d'acces");
+        addLog("INFO", "Wi-Fi secours: client deconnecte, %u client(s) connecte(s)",
+               static_cast<unsigned>(WiFi.softAPgetStationNum()));
     }, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
-    if (!WIFI_STA_SSID[0]) {
-        addLog("INFO", "Aucun Wi-Fi configure: portail captif de premiere installation");
+    if (!homeSSID.length()) {
+        WiFi.mode(WIFI_AP);
+        WiFi.setSleep(false); // Keep the V1 BLE/Wi-Fi coexistence behavior.
+        WiFi.setAutoReconnect(false);
+        addLog("INFO", "Premier demarrage: aucun Wi-Fi maison enregistre");
         startFallbackAP();
         return;
     }
     WiFi.mode(WIFI_STA);
-    beginHomeSTAConnection();
-    wifiAttemptStartedAt = millis();
-    staAttemptRunning = true;
-    wifiRecoveringAfterLoss = false;
-    addLog("INFO", "Wi-Fi STA prioritaire: connexion a %s", WIFI_STA_SSID);
-    while (WiFi.status() != WL_CONNECTED &&
-           millis() - wifiAttemptStartedAt < WIFI_STA_BOOT_TIMEOUT_MS) {
-        delay(500);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        staAttemptRunning = false;
-        addLog("INFO", "Wi-Fi maison connecte: http://%s/api/status, RSSI %ld dBm",
-               WiFi.localIP().toString().c_str(), static_cast<long>(WiFi.RSSI()));
-    } else {
-        addLog("WARN", "Wi-Fi maison indisponible apres %lu s; activation du secours AP seul",
-               static_cast<unsigned long>(WIFI_STA_BOOT_TIMEOUT_MS / 1000));
-        lastAPAttempt = millis();
-        startFallbackAP();
-    }
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
+    wifiDisconnectedSince = millis();
+    lastWiFiRetry = millis();
+    WiFi.begin(homeSSID.c_str(), homePassword.c_str());
+    addLog("INFO", "Connexion Wi-Fi domestique en cours: %s (2,4 GHz)", homeSSID.c_str());
+    addLog("INFO", "En absence de Wi-Fi domestique, secours %s apres %lu s", accessPointSSID.c_str(),
+           static_cast<unsigned long>(WIFI_FALLBACK_AFTER_MS / 1000));
 }
-void ensureNetworkHttp() {
-    const bool ready = apActive || WiFi.status() == WL_CONNECTED;
-    if (ready && !httpServerStarted) {
-        web.begin();
-        httpServerStarted = true;
-        addLog("INFO", "Serveur HTTP demarre sur %s port 80", apActive ? "AP" : "STA");
-    } else if (!ready && httpServerStarted) {
-        stopNetworkHttp();
-    }
-}
+
 void maintainWiFi() {
     const uint32_t now = millis();
-    if (apActive) {
-        const uint32_t clients = WiFi.softAPgetStationNum();
-        if (clients != 0) apLastClientSeenAt = now;
-        // Don't interrupt a connected captive-portal client.
-        if (!configAwaitingAck && !configPending && !configAwaitingNetwork && WIFI_STA_SSID[0] && !forcedAPMode && clients == 0 &&
-            now - apStartedAt >= WIFI_AP_HOME_RETRY_INTERVAL_MS &&
-            now - apLastClientSeenAt >= WIFI_AP_IDLE_BEFORE_RETRY_MS) {
-            addLog("INFO", "Wi-Fi secours sans client: recherche du reseau maison");
-            startHomeSTA("essai automatique apres secours");
-        }
-        return;
-    }
-    if (forcedAPMode) {
-        if (lastAPAttempt == 0 || now - lastAPAttempt >= WIFI_AP_RETRY_INTERVAL_MS) {
-            lastAPAttempt = now;
-            startFallbackAP();
-        }
-        return;
+    if (forcedAPMode || !homeSSID.length()) {
+        if (!apActive) startFallbackAP();
+        return; // Never reconnect without a configured home SSID.
     }
     const bool connected = WiFi.status() == WL_CONNECTED;
-    if (connected) {
-        if (!previousSTAConnected) {
-            previousSTAConnected = true;
-            staAttemptRunning = false;
-            wifiRecoveringAfterLoss = false;
-            addLog("INFO", "Wi-Fi maison actif: http://%s/api/status, RSSI %ld dBm",
-                   WiFi.localIP().toString().c_str(), static_cast<long>(WiFi.RSSI()));
+    if (connected != previousSTAConnected) {
+        previousSTAConnected = connected;
+        if (connected) {
+            staConnectedSince = now;
+            ramCheckpoint("wifi_maison_connecte");
+            const String ip = WiFi.localIP().toString();
+            addLog("INFO", "Wi-Fi %s connecte, adresse http://%s, RSSI %ld dBm",
+                   homeSSID.c_str(), ip.c_str(), static_cast<long>(WiFi.RSSI()));
+            if (MDNS.begin(WIFI_HOSTNAME)) {
+                MDNS.addService("http", "tcp", 80);
+                mdnsActive = true;
+                addLog("INFO", "mDNS disponible (selon appareils): http://%s.local", WIFI_HOSTNAME);
+            } else {
+                addLog("WARN", "mDNS indisponible; utiliser l'adresse IP du routeur");
+            }
+        } else {
+            if (mdnsActive) { MDNS.end(); mdnsActive = false; }
+            wifiDisconnectedSince = now;
+            ramCheckpoint("wifi_maison_deconnecte");
+            addLog("WARN", "Connexion au Wi-Fi domestique perdue; reconnexion automatique");
         }
-        if (!mdnsActive && MDNS.begin(WIFI_HOSTNAME)) {
-            MDNS.addService("http", "tcp", 80);
-            mdnsActive = true;
+    }
+    if (connected) {
+        if (apActive && now - staConnectedSince >= WIFI_AP_CLOSE_DELAY_MS &&
+            WiFi.softAPgetStationNum() == 0) {
+            stopFallbackAP(); // Never interrupt an active fallback client.
         }
         return;
     }
-    if (previousSTAConnected) {
-        previousSTAConnected = false;
-        staAttemptRunning = true;
-        wifiRecoveringAfterLoss = true;
-        wifiAttemptStartedAt = now;
-        stopNetworkHttp();
-        stopNetworkMdns();
-#if ESP_ARDUINO_VERSION_MAJOR >= 4
-        // One reconnect attempt only, no concurrent esp_wifi_connect calls.
-        const esp_err_t retryErr = esp_wifi_connect();
-        addLog(retryErr == ESP_OK ? "INFO" : "WARN",
-               "Wi-Fi Core4: tentative unique de reconnexion: %s",
-               esp_err_to_name(retryErr));
-#endif
-        addLog("WARN", "Wi-Fi domestique perdu: attente %lu s avant secours",
-               static_cast<unsigned long>(WIFI_FALLBACK_AFTER_MS / 1000));
-    }
-    const uint32_t timeout = wifiRecoveringAfterLoss
-        ? WIFI_FALLBACK_AFTER_MS : WIFI_STA_BOOT_TIMEOUT_MS;
-    if (now - wifiAttemptStartedAt >= timeout &&
+    if (!apActive && now - wifiDisconnectedSince >= WIFI_FALLBACK_AFTER_MS &&
         (lastAPAttempt == 0 || now - lastAPAttempt >= WIFI_AP_RETRY_INTERVAL_MS)) {
         lastAPAttempt = now;
         startFallbackAP();
     }
+    if (now - lastWiFiRetry >= WIFI_RETRY_INTERVAL_MS) {
+        lastWiFiRetry = now;
+        addLog("DEBUG", "Nouvelle tentative de connexion au Wi-Fi %s", homeSSID.c_str());
+        WiFi.reconnect();
+    }
 }
+
+// HTTP helpers. Accessible on the home LAN or on the fallback AP.

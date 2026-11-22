@@ -1,5 +1,5 @@
 /*
- * ANCEL BM200 - BLE to Wi-Fi gateway - V1.5.4 + captive portal + NVS.
+ * ANCEL BM200 - Standalone BLE to Wi-Fi gateway - version V1.5.0 (PSA Crypto / ESP32 core 4.x).
  * Board: ESP32-WROOM-32 / ESP32 Dev Module (classic ESP32).
  * Arduino ESP32 core 4.0.0 and NimBLE-Arduino 2.5.x.
  *
@@ -16,15 +16,8 @@
 #include <esp_attr.h>
 #include <esp_heap_caps.h>
 #include <WiFi.h>
-#include <esp_arduino_version.h>
-#if ESP_ARDUINO_VERSION_MAJOR >= 4
-#include <esp_wifi.h>
-#include <esp_err.h>
-#endif
 #include <ESPmDNS.h>
 #include <WebServer.h>
-#include <DNSServer.h>
-#include <esp_idf_version.h>
 #include <LittleFS.h>
 #include <Preferences.h>
 #include "esp32-hal-alloc-ble-mem.h"
@@ -32,12 +25,10 @@
 #include <sys/time.h>
 #include <time.h>
 #include <stdarg.h>
-#include <ctype.h>
 #include <string.h>
 
 #include "Config.h"
-void addLog(const char* level, const char* fmt, ...);
-#include "DeviceConfigModule.h"
+#include "WifiButtonAction.h"
 #include "BM200Protocol.h"
 
 
@@ -46,8 +37,8 @@ constexpr size_t MAX_SLOTS = 709;
 constexpr size_t MAX_HISTORY_BYTES = MAX_SLOTS * 4;
 constexpr size_t MAX_BLE_PACKET = 192;        // Captures show 16- or 160-byte messages.
 constexpr size_t BLE_QUEUE_DEPTH = 48;
-constexpr size_t LOG_CAPACITY = 32;
-constexpr size_t LOG_LINE_SIZE = 128;
+constexpr size_t LOG_CAPACITY = 90;
+constexpr size_t LOG_LINE_SIZE = 182;
 // NimBLE host scan timeout completion code (BLE_HS_ETIMEOUT).
 // Keep this local: NimBLE-Arduino does not expose its internal host headers
 // through the Arduino sketch include path.
@@ -154,27 +145,30 @@ uint32_t ramLastCheckpointMs = 0;
 
 // Network management in loop(): do not reboot the BLE stack when Wi-Fi changes.
 bool apActive = false;
-bool httpServerStarted = false;
 bool mdnsActive = false;
 bool previousSTAConnected = false;
-uint32_t wifiAttemptStartedAt = 0;
-uint32_t apStartedAt = 0;
-uint32_t apLastClientSeenAt = 0;
+uint32_t wifiDisconnectedSince = 0;
+uint32_t lastWiFiRetry = 0;
+uint32_t staConnectedSince = 0;
 uint32_t lastAPAttempt = 0;
-bool staAttemptRunning = false;
-bool wifiRecoveringAfterLoss = false;
 bool forcedAPMode = false;
 bool io0Pressed = false;
-bool io0Handled = false;
-static bool io0ConfigPressDone = false;
 uint32_t io0PressedSince = 0;
 uint32_t ledLastToggle = 0;
 bool ledLogicalOn = false;
+// Persisted Wi-Fi configuration lives in NVS, separately from BLE/LittleFS history.
+Preferences wifiPrefs;
+String homeSSID;
+String homePassword;
+String accessPointSSID;
+String accessPointPassword;
+uint32_t settingsUnlockedUntil = 0;
+uint32_t applyWifiAt = 0;
+uint8_t pendingWifiApply = 0; // 1 = home credentials, 2 = fallback AP
 
-// Forward declarations for the single-unit Arduino modules.
+
+// Forward declaration used by WebApiModule.h.
 bool initializeBleEngine(const char* origin);
-void applyStagedConfigAfterButton();
-void maintainConfigTransition();
 
 // Internal modules are included after shared state so they keep the same
 // single-translation-unit behavior as the validated V1.3.0 firmware.
@@ -184,10 +178,7 @@ void maintainConfigTransition();
 #include "BLEStartModule.h"
 #include "BLESyncModule.h"
 #include "BLELiveModule.h"
-#include "CaptivePortalModule.h"
 #include "WiFiModule.h"
-#include "ConfigApiModule.h"
-#include "LocalConfigPage.h"
 #include "WebApiModule.h"
 
 bool initializeBleEngine(const char* origin) {
@@ -224,10 +215,7 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(250);
     Serial.println();
-    Serial.println("==== ANCEL BM200 ESP32 V1.5.4 + portail captif ====");
-    Serial.printf("[BOOT] Arduino ESP32 Core %d.%d.%d\n",
-                  ESP_ARDUINO_VERSION_MAJOR, ESP_ARDUINO_VERSION_MINOR,
-                  ESP_ARDUINO_VERSION_PATCH);
+    Serial.println("==== ANCEL BM200 ESP32 Wi-Fi Gateway V1.5.2 ====");
     statusMutex = xSemaphoreCreateMutex();
     logsMutex = xSemaphoreCreateMutex();
     blePackets = xQueueCreate(BLE_QUEUE_DEPTH, sizeof(BlePacket));
@@ -255,8 +243,8 @@ void setup() {
     }
     interruptedSyncMarker = 0;
 
-    // Never format an existing LittleFS partition automatically.
-    fsReady = LittleFS.begin(ALLOW_LITTLEFS_AUTOFORMAT);
+    // First boot may format an empty LittleFS partition.
+    fsReady = LittleFS.begin(true);
     addLog(fsReady ? "INFO" : "ERROR", "LittleFS: %s", fsReady ? "monte" : "echec du montage");
     if (fsReady) {
         LittleFS.remove(PATH_HISTORY_TEMP);
@@ -280,24 +268,22 @@ void setup() {
         digitalWrite(STATUS_LED_PIN, STATUS_LED_ACTIVE_HIGH ? LOW : HIGH);
     }
 
-    loadDeviceConfig();
-    addLog("INFO", "Configuration NVS chargee: Wi-Fi %s", WIFI_STA_SSID[0] ? "configure" : "a configurer");
     ramCheckpoint("avant_wifi");
+    initStoredWiFi();
     initWiFi();
-    maintainCaptivePortal();
     ramCheckpoint("apres_wifi_init");
 
     ramCheckpoint("avant_serveur_web");
     registerRoutes();
-    ensureNetworkHttp();
-    if (!httpServerStarted) addLog("WARN", "Serveur HTTP en attente du reseau Wi-Fi");
+    web.begin();
+    addLog("INFO", "Serveur Web disponible sur port 80");
     ramCheckpoint("serveur_web_actif");
 
     if (!initBm200Crypto()) {
-        addLog("ERROR", "Chiffrement AES indisponible ; BLE non demarre");
+        addLog("ERROR", "Chiffrement PSA AES indisponible ; BLE non demarre");
         return;
     }
-    addLog("INFO", "Chiffrement AES-128 pret (PSA Core4 / mbedTLS Core3)");
+    addLog("INFO", "Chiffrement PSA AES-128 pret");
 
     if (!initializeBleEngine("demarrage")) {
         addLog("ERROR", "BLE indisponible au demarrage; utiliser 'Forcer reconnexion' apres correction/reessai");
@@ -306,12 +292,9 @@ void setup() {
 
 void loop() {
     maintainWiFiButton();
-    maintainConfigTransition();
-    maintainDiagnosticsTimeout();
+    applyPendingWiFi();
     maintainWiFi();
-    maintainCaptivePortal();
-    ensureNetworkHttp();
     maintainStatusLed();
-    if (httpServerStarted) web.handleClient();
-    delay(2);
+    web.handleClient();
+    delay(5);
 }

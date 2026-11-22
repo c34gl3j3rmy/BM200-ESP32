@@ -112,11 +112,9 @@ bool performStartReport(String& error) {
 
     do {
         if (!fsReady) { error = "LittleFS non monte"; break; }
-        if (diagnosticLevel == 2) {
-            trace = LittleFS.open(PATH_START_TRACE, "w");
-            if (trace) trace.println("uptime_ms,direction,bytes,encrypted_hex,decrypted_hex");
-            else addLog("WARN", "Trace demarrage indisponible, lecture poursuivie");
-        }
+        trace = LittleFS.open(PATH_START_TRACE, "w");
+        if (!trace) { error = "Ouverture de la trace demarrage impossible"; break; }
+        trace.println("uptime_ms,direction,bytes,encrypted_hex,decrypted_hex");
         xQueueReset(blePackets);
 
         setPhase("Demarrage: recherche BM200");

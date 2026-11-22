@@ -10,4 +10,5 @@ pre{background:#141827;border:1px solid #363e54;color:#cbd7e9;max-height:285px;o
 
 .endpoint input{min-width:180px;max-width:100%;flex:1;padding:10px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--text)}.endpoint label{display:block;font-weight:600;margin-bottom:8px}
 
-#device-settings form{display:grid;gap:8px}#device-settings input,#device-settings select{width:100%;max-width:100%;box-sizing:border-box}#device-settings label{font-weight:600;margin-top:7px}#device-settings .controls{margin-top:12px;flex-wrap:wrap}
+/* V1.5.1 settings navigation */
+[hidden]{display:none!important}.tabs{display:flex;gap:8px;margin:8px 0 14px}.tabs button{flex:1}.tabs button.active{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:700}.settings-group form{display:grid;gap:10px}.settings-group label{font-weight:600;font-size:13px}.settings-group input:not([type=checkbox]){width:100%;padding:11px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text);font:inherit}.settings-group .checkline{display:flex;align-items:center;gap:9px}.settings-group form button{margin-top:5px}

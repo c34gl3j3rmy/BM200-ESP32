@@ -1,9 +1,6 @@
 """Offline protocol and frontend sanity checks (no hardware, no network)."""
-import html
 import pathlib
-import re
 import subprocess
-import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "firmware" / "BM200_ESP32"
 WEB = pathlib.Path(__file__).resolve().parents[1] / "web"
@@ -33,44 +30,47 @@ assert (WEB / 'index.html').exists() and 'Forcer reconnexion' in (WEB / 'index.h
 assert 'WEB_PAGE' not in (ROOT / 'BM200_ESP32.ino').read_text()
 print('PWA JavaScript and externalized UI: OK')
 firmware = "\n".join(path.read_text() for path in [ROOT / "BM200_ESP32.ino", *sorted(ROOT.glob("*Module.h"))])
-for route in ['/api/sync','/api/logs','/api/status','/api/start','/api/ble/recover','/api/preview','/api/history.bin','/download/history.csv','/download/history.json','/download/trace.csv','/download/start.json','/download/start-trace.csv']:
+for route in ['/api/sync','/api/logs','/api/status','/api/start','/api/ble/recover','/api/preview','/api/history.bin','/api/settings/wifi','/download/history.csv','/download/history.json','/download/trace.csv','/download/start.json','/download/start-trace.csv']:
     assert '"'+route+'"' in firmware, 'missing route '+route
 print("HTTP route inventory: OK")
 
 # Network mode API and secrets checks (static, does not disclose secret values).
 firmware = "\n".join(path.read_text() for path in [ROOT / "BM200_ESP32.ino", *sorted(ROOT.glob("*Module.h"))])
-for token in ['WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD)', 'WiFi.softAP(',
+for token in ['WiFi.begin(homeSSID.c_str(), homePassword.c_str())', 'WiFi.softAP(',
               'maintainWiFi();', 'MDNS.begin(WIFI_HOSTNAME)',
               r'out += ",\"wifi\":{']:
     assert token in firmware, f"missing Wi-Fi feature: {token}"
 assert 'Secrets.h' in (ROOT / '.gitignore').read_text()
-print("Wi-Fi fallback and secret management: OK")
+assert 'wifiPrefs.putString("home_ssid"' in firmware
+assert 'wifiPrefs.putString("ap_pass"' in firmware
+assert 'WIFI_AP_RESET_HOLD_MS' in firmware
+print("Wi-Fi fallback, NVS configuration and BOOT reset: OK")
 
-# Core 4 Wi-Fi STA/ AP-only fallback and captive portal. Verify mode transitions.
-assert 'WiFi.mode(WIFI_STA);' in firmware
-assert 'WiFi.mode(WIFI_AP);' in firmware
-assert 'WiFi.mode(WIFI_AP_STA)' not in firmware
-assert 'WiFi.reconnect()' not in (ROOT / 'WiFiModule.h').read_text().replace('WiFi.reconnect() while the AP is serving clients.', '')
-assert 'WiFi.AP.enableDhcpCaptivePortal()' in firmware
-assert 'bm200CaptiveDns.start(53, "*", ip)' in firmware
-for route in ['/portal', '/generate_204', '/api/ping']:
-    assert '"'+route+'"' in firmware
-# Do not disclose secrets in public firmware, config or documentation.
-assert not (ROOT / 'Secrets.h').exists()
+# Espressif requires hostname configuration before WiFi.mode/start.
+config = (ROOT / 'Config.h').read_text()
+assert firmware.index('WiFi.setHostname(WIFI_HOSTNAME)') < firmware.index('WiFi.mode(WIFI_STA);')
+# Keep legacy private files ignored if they exist locally from older versions,
+# but never make the new firmware depend on them.
+assert 'Secrets.h' in (ROOT / '.gitignore').read_text()
+assert '#include "Secrets.h"' not in config
+print("Hostname order and Wi-Fi credential isolation: OK")
+
+# Verify that the firmware can boot without any private header.
+wifi = (ROOT / 'WiFiModule.h').read_text()
+assert '#include "Secrets.h"' not in config
+assert 'WIFI_STA_PASSWORD' not in config + wifi
+assert 'getString("home_ssid", "")' in wifi
+assert 'if (!homeSSID.length())' in wifi
+assert 'startFallbackAP();' in wifi
 assert not (ROOT / 'Secrets.example.h').exists()
-assert '#include "Secrets.h"' not in firmware
-assert 'Preferences.h' in firmware
-assert 'LOG_CAPACITY = 32' in firmware
-assert 'LOG_LINE_SIZE = 128' in firmware
-assert 'if (diagnosticLevel == 2)' in (ROOT / 'BLESyncModule.h').read_text()
-assert 'if (diagnosticLevel == 2)' in (ROOT / 'BLEStartModule.h').read_text()
-assert 'maintainDiagnosticsTimeout()' in firmware
-assert 'putString("ssid"' in firmware
-assert 'configAwaitingAck' in firmware
-assert 'CONFIG_BUTTON_HOLD_MS = 2000' in (ROOT / 'Config.h').read_text()
-for route in ['/api/config','/api/config/stage','/api/config/confirm','/config','/api/health']:
-    assert '"'+route+'"' in firmware
-print("Wi-Fi AP seul / portail captif et isol. identifiants: OK")
+print('First-boot Wi-Fi without Secrets.h: OK')
+
+# Exercise exact physical BOOT timing boundaries in portable C++.
+button_bin = TESTS / "_button_test_bin"
+run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
+     str(TESTS / "button_test.cpp"), "-o", str(button_bin)])
+print(run([str(button_bin)]).stdout.decode().strip())
+button_bin.unlink(missing_ok=True)
 
 # Prevent reintroducing a dependency on internal NimBLE host include paths.
 assert "#include <host/ble_hs.h>" not in firmware

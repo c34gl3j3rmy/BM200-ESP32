@@ -3,7 +3,7 @@
 bool performSync(const SyncRequest& sync, String& error) {
     const uint16_t slots = sync.count;
     uint16_t decoded = 0;
-    setPhase("Preparation synchronisation BLE");
+    setPhase("Preparation de la trace BLE");
     File trace;
     NimBLEClient* client = nullptr;
     bool success = false;
@@ -19,11 +19,9 @@ bool performSync(const SyncRequest& sync, String& error) {
     ramCheckpoint("sync_debut");
     do {
         if (!fsReady) { error = "LittleFS non monte; stockage impossible"; break; }
-        if (diagnosticLevel == 2) {
-            trace = LittleFS.open(PATH_TRACE_TEMP, "w");
-            if (trace) trace.println("uptime_ms,direction,bytes,encrypted_hex,decrypted_hex");
-            else addLog("WARN", "Trace BLE indisponible, synchronisation poursuivie");
-        }
+        trace = LittleFS.open(PATH_TRACE_TEMP, "w");
+        if (!trace) { error = "Ouverture de la trace BLE impossible"; break; }
+        trace.println("uptime_ms,direction,bytes,encrypted_hex,decrypted_hex");
         xQueueReset(blePackets);
 
         ramCheckpoint("avant_scan_ble");

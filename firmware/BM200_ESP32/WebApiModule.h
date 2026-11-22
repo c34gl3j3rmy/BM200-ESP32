@@ -18,7 +18,7 @@ void sendStatus() {
     out += "{\"mac\":" + jsonString(BM200_BLE_MAC);
     const bool staOnline = WiFi.status() == WL_CONNECTED;
     out += ",\"wifi_clients\":" + String(apActive ? WiFi.softAPgetStationNum() : 0);
-    out += ",\"wifi\":{\"home_ssid\":" + jsonString(WIFI_STA_SSID);
+    out += ",\"wifi\":{\"home_ssid\":" + jsonString(homeSSID);
     out += ",\"mode\":" + jsonString(forcedAPMode ? "secours force" : (staOnline ? (apActive ? "maison + secours" : "maison") : (apActive ? "secours" : "connexion")));
     out += ",\"sta_connected\":" + String(staOnline ? "true" : "false");
     out += ",\"sta_ip\":" + jsonString(staOnline ? WiFi.localIP().toString() : String());
@@ -30,7 +30,6 @@ void sendStatus() {
     out += ",\"mdns_name\":" + jsonString(mdnsActive ? String(WIFI_HOSTNAME) + ".local" : String());
     out += "}";
     out += ",\"uptime_ms\":" + String(millis());
-    out += ",\"diagnostics_level\":" + String(diagnosticLevel);
     out += ",\"heap_free\":" + String(ESP.getFreeHeap());
     out += ",\"heap_total\":" + String(ESP.getHeapSize());
     out += ",\"heap_min\":" + String(ESP.getMinFreeHeap());
@@ -450,43 +449,89 @@ void sendBinaryHistory() {
     f.close();
 }
 
+// Changing either network requires physical BOOT authorization (5-29 s hold).
+// Protects against untrusted clients, including when the fallback AP is open.
+// Avoid HTTP request bodies containing passwords in logs, links or exports.
+void sendWifiSettings() {
+    String out = "{\"home_ssid\":" + jsonString(homeSSID);
+    out += ",\"ap_ssid\":" + jsonString(accessPointSSID);
+    out += ",\"ap_protected\":" + String(accessPointPassword.length() ? "true" : "false");
+    out += ",\"unlocked\":" + String(wifiSettingsUnlocked() ? "true" : "false");
+    out += ",\"unlock_seconds\":" + String(wifiSettingsUnlocked() ? (settingsUnlockedUntil - millis()) / 1000 : 0);
+    out += "}";
+    dontCache();
+    web.send(200, "application/json; charset=utf-8", out);
+}
+
+void updateWifiSettings() {
+    dontCache();
+    if (!wifiSettingsUnlocked()) {
+        web.send(403, "text/plain; charset=utf-8", "Maintenir BOOT de 5 a 29 secondes pour autoriser les changements pendant 10 minutes");
+        return;
+    }
+    if (!web.hasArg("kind") || !web.hasArg("ssid")) {
+        web.send(400, "text/plain", "Champs kind et ssid manquants");
+        return;
+    }
+    String kind = web.arg("kind");
+    String ssid = web.arg("ssid");
+    String password = web.hasArg("password") ? web.arg("password") : String();
+    const bool changePassword = web.hasArg("password");
+    if (ssid.length() < 1 || ssid.length() > 32 || ssid.indexOf('\n') >= 0 || ssid.indexOf('\r') >= 0) {
+        web.send(400, "text/plain", "SSID invalide (1 a 32 caracteres)"); return;
+    }
+    if (kind == "ap") {
+        if (changePassword && password.length() && (password.length() < 8 || password.length() > 63)) {
+            web.send(400, "text/plain", "Mot de passe WPA2: 8 a 63 caracteres, ou vide pour reseau ouvert"); return;
+        }
+        if (!changePassword && accessPointPassword.length()) password = accessPointPassword;
+        accessPointSSID = ssid;
+        accessPointPassword = password;
+        wifiPrefs.putString("ap_ssid", accessPointSSID);
+        wifiPrefs.putString("ap_pass", accessPointPassword);
+        pendingWifiApply = 2;
+    } else if (kind == "home") {
+        if (changePassword && password.length() > 63) {
+            web.send(400, "text/plain", "Mot de passe trop long"); return;
+        }
+        if (!changePassword) password = homePassword;
+        homeSSID = ssid;
+        homePassword = password;
+        wifiPrefs.putString("home_ssid", homeSSID);
+        wifiPrefs.putString("home_pass", homePassword);
+        pendingWifiApply = 1;
+    } else {
+        web.send(400, "text/plain", "Reseau inconnu"); return;
+    }
+    applyWifiAt = millis() + 1500; // Respond before changing the network.
+    addLog("INFO", "Configuration reseau %s modifiee, application programmee", kind.c_str());
+    web.send(200, "application/json", "{\"ok\":true,\"reconnect\":true}");
+}
+
 void registerRoutes() {
     // Public GitHub Pages frontend. No cookies or auth headers are used.
     // Origin restrictions and a token should be added before exposing the ESP32 to untrusted LANs.
     web.enableCORS(true);
-    // Captive portal probes. A 302 (not 204) triggers Android login detection.
-    web.on("/portal", HTTP_GET, sendCaptivePortalPage);
-    web.on("/config", HTTP_GET, []() { dontCache(); web.send_P(200, "text/html; charset=utf-8", LOCAL_CONFIG_HTML); });
-    web.on("/generate_204", HTTP_GET, sendCaptiveProbe);
-    web.on("/gen_204", HTTP_GET, sendCaptiveProbe);
-    web.on("/hotspot-detect.html", HTTP_GET, sendCaptiveProbe);
-    web.on("/library/test/success.html", HTTP_GET, sendCaptiveProbe);
-    web.on("/connecttest.txt", HTTP_GET, sendCaptiveProbe);
-    web.on("/ncsi.txt", HTTP_GET, sendCaptiveProbe);
-    web.on("/fwlink", HTTP_GET, sendCaptiveProbe);
-    web.on("/api/ping", HTTP_GET, []() { dontCache(); web.send(200, "text/plain", "PONG"); });
-    // Local rescue remains available if GitHub Pages/PWA is inaccessible.
+    // Offline local setup works even when the GitHub Pages PWA is not cached.
     web.on("/", HTTP_GET, []() {
-        if (apActive) { sendCaptivePortalPage(); return; }
         dontCache();
-        web.send(200,"text/html; charset=utf-8","<!doctype html><meta name=viewport content='width=device-width'><title>BM200 API</title><h2>BM200 - ESP32 API</h2><p>Interface: installer la PWA depuis GitHub Pages.</p><p><a href='/api/status'>Etat JSON</a> | <a href='/api/logs'>Journal</a></p>");
+        static const char page[] PROGMEM = R"BM200(
+<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BM200 - Wi-Fi</title>
+<style>body{font:16px system-ui;background:#191c29;color:#f7f7fb;max-width:520px;margin:20px auto;padding:12px}section{background:#292f41;border-radius:12px;padding:16px;margin:14px 0}input,button{box-sizing:border-box;width:100%;padding:11px;margin:7px 0;border-radius:8px;border:1px solid #566;background:#151827;color:#fff}button{background:#297cf1}small{color:#bbc}label{display:block}</style>
+<h1>BM200 / ESP32</h1><p>Configuration Wi-Fi locale sans Internet. Maintenir BOOT entre 5 et 29 secondes puis le relâcher pour autoriser les changements pendant 10 minutes.</p>
+<section><h2>Wi-Fi maison</h2><form data-kind="home"><label>SSID<input name="ssid" maxlength="32" required></label><label>Nouveau mot de passe<input type="password" name="password" autocomplete="new-password" placeholder="Vide : inchangé"></label><button>Enregistrer</button></form></section>
+<section><h2>Wi-Fi direct</h2><form data-kind="ap"><label>SSID<input name="ssid" maxlength="32" required></label><label>Nouveau mot de passe WPA2<input type="password" name="password" autocomplete="new-password" placeholder="Vide : inchangé"></label><label><input type="checkbox" name="open" style="width:auto"> Réseau ouvert, sans mot de passe</label><button>Enregistrer</button></form></section>
+<small>BOOT entre 30 et 59 secondes puis relâcher : efface seulement le mot de passe Wi-Fi direct. Au-delà de 59 s : aucune action. Les historiques restent conservés. <a style="color:#9bf" href="/api/status">État JSON</a></small><p id="result"></p>
+<script>
+const output=document.getElementById('result');
+fetch('/api/settings/wifi').then(r=>r.json()).then(c=>{document.querySelector('[data-kind="home"] [name="ssid"]').value=c.home_ssid;document.querySelector('[data-kind="ap"] [name="ssid"]').value=c.ap_ssid;output.textContent=c.unlocked?'Configuration autorisée':'Maintenir BOOT 5 à 29 secondes puis relâcher';}).catch(e=>output.textContent=e.message);
+document.querySelectorAll('form').forEach(f=>f.addEventListener('submit',async e=>{e.preventDefault();const data=new URLSearchParams({kind:f.dataset.kind,ssid:f.elements.ssid.value});const pass=f.elements.password.value;if(f.dataset.kind==='ap'&&f.elements.open.checked){data.set('password','')}else if(pass){data.set('password',pass)};try{const r=await fetch('/api/settings/wifi',{method:'POST',body:data});const t=await r.text();if(!r.ok)throw Error(t);output.textContent='Enregistré. Le réseau va redémarrer : reconnecter le téléphone.';f.elements.password.value='';}catch(x){output.textContent=x.message}}));
+</script></html>)BM200";
+        web.send_P(200, "text/html; charset=utf-8", page);
     });
-    web.on("/api/health", HTTP_GET, []() {
-        String result = String("{\"heap_free\":") + String(ESP.getFreeHeap()) +
-            ",\"heap_min\":" + String(ESP.getMinFreeHeap()) +
-            ",\"heap_largest\":" + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)) +
-            ",\"dropped_packets\":" + String(static_cast<uint32_t>(droppedPackets)) +
-            ",\"wifi_ok\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") +
-            ",\"ap_active\":" + String(apActive ? "true" : "false") +
-            ",\"ble_ready\":" + String(bleReady ? "true" : "false") +
-            ",\"diagnostics\":" + String(diagnosticLevel) + "}";
-        dontCache(); web.send(200, "application/json", result);
-    });
-    web.on("/api/info", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"1.5.4\",\"config_schema\":1}"); });
-    web.on("/api/config", HTTP_GET, sendConfigState);
-    web.on("/api/config/stage", HTTP_POST, requestConfigChange);
-    web.on("/api/config/confirm", HTTP_POST, confirmConfig);
     web.on("/api/status", HTTP_GET, sendStatus);
+    web.on("/api/settings/wifi", HTTP_GET, sendWifiSettings);
+    web.on("/api/settings/wifi", HTTP_POST, updateWifiSettings);
     web.on("/api/logs", HTTP_GET, sendLogs);
     web.on("/api/preview", HTTP_GET, sendPreview);
     web.on("/api/history.bin", HTTP_GET, sendBinaryHistory);
@@ -514,10 +559,6 @@ void registerRoutes() {
             web.sendHeader("Access-Control-Allow-Private-Network", "true");
             web.send(204, "text/plain", "");
             return;
-        }
-        if (apActive && (web.method() == HTTP_GET || web.method() == HTTP_HEAD) &&
-            !web.uri().startsWith("/api/") && !web.uri().startsWith("/download/")) {
-            sendCaptiveRedirect(); return;
         }
         web.send(404, "text/plain", "Page introuvable");
     });
