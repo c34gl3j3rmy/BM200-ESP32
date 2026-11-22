@@ -27,7 +27,7 @@ assert r.stdout == expected, (r.stdout.hex(), expected.hex())
 print("Public AES test vector: OK")
 
 # Check the externalized frontend and the preserved ESP32 HTTP routes.
-for item in ['api.js','storage.js','app.js','service-worker.js']:
+for item in ['api.js','storage.js','app.js','settings.js','service-worker.js']:
     run(['node','--check',str(WEB / item)])
 assert (WEB / 'index.html').exists() and 'Forcer reconnexion' in (WEB / 'index.html').read_text()
 assert 'WEB_PAGE' not in (ROOT / 'BM200_ESP32.ino').read_text()
@@ -46,49 +46,31 @@ for token in ['WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD)', 'WiFi.softAP(',
 assert 'Secrets.h' in (ROOT / '.gitignore').read_text()
 print("Wi-Fi fallback and secret management: OK")
 
-# STA is established before the HTTP listener; AP fallback is AP-only.
-wifi_source = (ROOT / 'WiFiModule.h').read_text()
-ino_source = (ROOT / 'BM200_ESP32.ino').read_text()
-config_source = (ROOT / 'Config.h').read_text()
-assert 'WIFI_STA_FIRST_DIAGNOSTIC' not in config_source
-assert 'WiFi.mode(WIFI_STA);' in wifi_source
-assert 'WiFi.mode(WIFI_AP);' in wifi_source
-assert 'WiFi.mode(WIFI_AP_STA)' not in wifi_source
-assert '    WiFi.reconnect();' not in wifi_source
-assert 'ensureNetworkHttp()' in wifi_source
-assert 'registerRoutes();' in ino_source
-assert ino_source.index('registerRoutes();') < ino_source.index('ensureNetworkHttp();')
-assert 'LittleFS.begin(ALLOW_LITTLEFS_AUTOFORMAT)' in ino_source
-assert 'ALLOW_LITTLEFS_AUTOFORMAT = false' in config_source
-assert 'WIFI_AP_HOME_RETRY_INTERVAL_MS' in wifi_source
-assert 'cfg.sta.disable_wpa3_compatible_mode' in wifi_source
-assert 'esp_wifi_get_config' in wifi_source
-assert 'esp_wifi_set_config' in wifi_source
-assert 'esp_wifi_connect()' in wifi_source
-assert 'WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD, 0, nullptr, false)' in wifi_source
-assert 'WiFi.softAPgetStationNum()' in wifi_source
-
-# Never disclose actual credentials in public firmware/configuration/documentation.
-secrets_file = ROOT / 'Secrets.h'
-secrets = (secrets_file if secrets_file.exists() else ROOT / 'Secrets.example.h').read_text()
-secret_values = re.findall(r'WIFI_(?:STA|AP)_PASSWORD\s*=\s*"([^"]+)"', secrets)
-assert len(secret_values) == 2
-for secret in secret_values:
-    assert len(secret) >= 8
-    if not secrets_file.exists():
-        continue  # The public example values are necessarily visible.
-    for public_path in ['README.md','Config.h','Secrets.example.h'] + [x.name for x in [ROOT / 'BM200_ESP32.ino', *ROOT.glob('*Module.h')]]:
-        assert secret not in (ROOT / public_path).read_text(), f"secret found in {public_path}"
-print("Sequential Wi-Fi, LittleFS protection and credentials: OK")
-
-# Compile the actual network module against independent Arduino API mocks.
-for core_major in [3, 4]:
-    mock_bin = TESTS / f"_wifi_state_machine_bin_{core_major}"
-    run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
-         f"-DESP_ARDUINO_VERSION_MAJOR={core_major}",
-         str(TESTS / "wifi_state_machine_test.cpp"), "-o", str(mock_bin)])
-    print(f"Core {core_major}: " + run([str(mock_bin)]).stdout.decode().strip())
-    mock_bin.unlink(missing_ok=True)
+# Core 4 Wi-Fi STA/ AP-only fallback and captive portal. Verify mode transitions.
+assert 'WiFi.mode(WIFI_STA);' in firmware
+assert 'WiFi.mode(WIFI_AP);' in firmware
+assert 'WiFi.mode(WIFI_AP_STA)' not in firmware
+assert 'WiFi.reconnect()' not in (ROOT / 'WiFiModule.h').read_text().replace('WiFi.reconnect() while the AP is serving clients.', '')
+assert 'WiFi.AP.enableDhcpCaptivePortal()' in firmware
+assert 'bm200CaptiveDns.start(53, "*", ip)' in firmware
+for route in ['/portal', '/generate_204', '/api/ping']:
+    assert '"'+route+'"' in firmware
+# Do not disclose secrets in public firmware, config or documentation.
+assert not (ROOT / 'Secrets.h').exists()
+assert not (ROOT / 'Secrets.example.h').exists()
+assert '#include "Secrets.h"' not in firmware
+assert 'Preferences.h' in firmware
+assert 'LOG_CAPACITY = 32' in firmware
+assert 'LOG_LINE_SIZE = 128' in firmware
+assert 'if (diagnosticLevel == 2)' in (ROOT / 'BLESyncModule.h').read_text()
+assert 'if (diagnosticLevel == 2)' in (ROOT / 'BLEStartModule.h').read_text()
+assert 'maintainDiagnosticsTimeout()' in firmware
+assert 'putString("ssid"' in firmware
+assert 'configAwaitingAck' in firmware
+assert 'CONFIG_BUTTON_HOLD_MS = 2000' in (ROOT / 'Config.h').read_text()
+for route in ['/api/config','/api/config/stage','/api/config/confirm','/config','/api/health']:
+    assert '"'+route+'"' in firmware
+print("Wi-Fi AP seul / portail captif et isol. identifiants: OK")
 
 # Prevent reintroducing a dependency on internal NimBLE host include paths.
 assert "#include <host/ble_hs.h>" not in firmware

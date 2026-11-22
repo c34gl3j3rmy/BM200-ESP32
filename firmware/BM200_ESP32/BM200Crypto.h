@@ -1,10 +1,9 @@
 #pragma once
-// BM200 AES-128 ECB per block (equivalent to zero-IV CBC reset each block).
-#include <esp_arduino_version.h>
-#if ESP_ARDUINO_VERSION_MAJOR >= 4
 // ESP32 Arduino core 4.x (ESP-IDF 6 / Mbed TLS 4): use public PSA Crypto API.
 // The BM200 cipher is AES-128-CBC with a zero IV restarted for EVERY 16-byte
 // block, which is equivalent to AES-128-ECB on each individual block.
+#include <esp_arduino_version.h>
+#if ESP_ARDUINO_VERSION_MAJOR >= 4
 #include <psa/crypto.h>
 
 static psa_key_id_t bm200AesKey = PSA_KEY_ID_NULL;
@@ -44,11 +43,9 @@ bool aesBlock(const uint8_t input[16], uint8_t output[16], bool encrypt) {
 
 #else
 #include <mbedtls/aes.h>
-
 static mbedtls_aes_context bm200AesEncrypt;
 static mbedtls_aes_context bm200AesDecrypt;
 static bool bm200AesReady = false;
-
 bool initBm200Crypto() {
     if (bm200AesReady) return true;
     mbedtls_aes_init(&bm200AesEncrypt);
@@ -64,7 +61,6 @@ bool initBm200Crypto() {
     bm200AesReady = true;
     return true;
 }
-
 bool aesBlock(const uint8_t input[16], uint8_t output[16], bool encrypt) {
     if (!bm200AesReady) return false;
     return mbedtls_aes_crypt_ecb(encrypt ? &bm200AesEncrypt : &bm200AesDecrypt,

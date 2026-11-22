@@ -1,0 +1,13 @@
+#pragma once
+// Small stand-alone setup page, available even without Internet / GitHub Pages.
+static const char LOCAL_CONFIG_HTML[] PROGMEM = R"PAGE(
+<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BM200 Configuration</title><style>body{font:16px system-ui;max-width:470px;margin:auto;padding:20px;background:#101827;color:white}label{display:block;margin:15px 0 6px}input,select,button{box-sizing:border-box;width:100%;padding:11px;border-radius:7px;border:1px solid #64748b}button{background:#0d9488;color:white;margin-top:15px}p{line-height:1.5}</style>
+<h2>BM200 - Configurer l'ESP32</h2><p>Les modifications exigent de maintenir le bouton IO0 de l'ESP32 pendant 2 secondes. L'ancien Wi-Fi est conserve tant que la connexion n'est pas confirmee.</p>
+<form id="f"><label>SSID Wi-Fi maison</label><input name="ssid" id="ssid" maxlength="32" autocomplete="off"><label>Nouveau mot de passe Wi-Fi (laisser vide pour conserver)</label><input name="password" type="password" maxlength="63" autocomplete="off"><label>Mot de passe du point d'acces (laisser vide pour conserver)</label><input name="ap_password" type="password" maxlength="63" autocomplete="off"><label>Adresse MAC du BM200</label><input name="mac" id="mac" maxlength="17"><label>Diagnostics</label><select name="diagnostics" id="diag"><option value="0">Normal</option><option value="1">Diagnostic</option><option value="2">Complet</option></select><button type="submit">Preparer les changements</button></form><button id="confirm" type="button">Confirmer apres connexion</button><p id="msg" aria-live="polite"></p>
+<script>
+const msg=document.querySelector('#msg');async function state(){try{let r=await fetch('/api/config',{cache:'no-store'});let s=await r.json();document.querySelector('#ssid').value=s.ssid;document.querySelector('#mac').value=s.mac;document.querySelector('#diag').value=s.diagnostics;return s}catch(e){msg.textContent=e.message}}
+state();document.querySelector('#f').onsubmit=async e=>{e.preventDefault();try{let r=await fetch('/api/config/stage',{method:'POST',body:new URLSearchParams(new FormData(e.target))});let v=await r.json();msg.textContent=v.message+' (sur cet appareil : IO0 2 secondes)'}catch(e){msg.textContent=e.message}};
+document.querySelector('#confirm').onclick=async()=>{try{let s=await state();if(!s)return;if(!s.awaiting_confirmation){msg.textContent='Pas de connexion en attente de confirmation';return}let r=await fetch('/api/config/confirm',{method:'POST',body:new URLSearchParams({nonce:s.nonce})});msg.textContent=(await r.json()).message}catch(e){msg.textContent=e.message+' ; reconnecter au nouveau reseau puis ouvrir la nouvelle adresse IP'}};
+</script></html>
+)PAGE";

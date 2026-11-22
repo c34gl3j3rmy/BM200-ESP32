@@ -30,6 +30,7 @@ void sendStatus() {
     out += ",\"mdns_name\":" + jsonString(mdnsActive ? String(WIFI_HOSTNAME) + ".local" : String());
     out += "}";
     out += ",\"uptime_ms\":" + String(millis());
+    out += ",\"diagnostics_level\":" + String(diagnosticLevel);
     out += ",\"heap_free\":" + String(ESP.getFreeHeap());
     out += ",\"heap_total\":" + String(ESP.getHeapSize());
     out += ",\"heap_min\":" + String(ESP.getMinFreeHeap());
@@ -453,16 +454,38 @@ void registerRoutes() {
     // Public GitHub Pages frontend. No cookies or auth headers are used.
     // Origin restrictions and a token should be added before exposing the ESP32 to untrusted LANs.
     web.enableCORS(true);
+    // Captive portal probes. A 302 (not 204) triggers Android login detection.
+    web.on("/portal", HTTP_GET, sendCaptivePortalPage);
+    web.on("/config", HTTP_GET, []() { dontCache(); web.send_P(200, "text/html; charset=utf-8", LOCAL_CONFIG_HTML); });
+    web.on("/generate_204", HTTP_GET, sendCaptiveProbe);
+    web.on("/gen_204", HTTP_GET, sendCaptiveProbe);
+    web.on("/hotspot-detect.html", HTTP_GET, sendCaptiveProbe);
+    web.on("/library/test/success.html", HTTP_GET, sendCaptiveProbe);
+    web.on("/connecttest.txt", HTTP_GET, sendCaptiveProbe);
+    web.on("/ncsi.txt", HTTP_GET, sendCaptiveProbe);
+    web.on("/fwlink", HTTP_GET, sendCaptiveProbe);
+    web.on("/api/ping", HTTP_GET, []() { dontCache(); web.send(200, "text/plain", "PONG"); });
     // Local rescue remains available if GitHub Pages/PWA is inaccessible.
     web.on("/", HTTP_GET, []() {
+        if (apActive) { sendCaptivePortalPage(); return; }
         dontCache();
         web.send(200,"text/html; charset=utf-8","<!doctype html><meta name=viewport content='width=device-width'><title>BM200 API</title><h2>BM200 - ESP32 API</h2><p>Interface: installer la PWA depuis GitHub Pages.</p><p><a href='/api/status'>Etat JSON</a> | <a href='/api/logs'>Journal</a></p>");
     });
-    // Diagnostic minimal : verifier la reponse du serveur sans allouer de gros JSON.
-    web.on("/api/ping", HTTP_GET, []() {
-        Serial.println("[HTTP] GET /api/ping");
-        web.send(200, "text/plain", "PONG");
+    web.on("/api/health", HTTP_GET, []() {
+        String result = String("{\"heap_free\":") + String(ESP.getFreeHeap()) +
+            ",\"heap_min\":" + String(ESP.getMinFreeHeap()) +
+            ",\"heap_largest\":" + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)) +
+            ",\"dropped_packets\":" + String(static_cast<uint32_t>(droppedPackets)) +
+            ",\"wifi_ok\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") +
+            ",\"ap_active\":" + String(apActive ? "true" : "false") +
+            ",\"ble_ready\":" + String(bleReady ? "true" : "false") +
+            ",\"diagnostics\":" + String(diagnosticLevel) + "}";
+        dontCache(); web.send(200, "application/json", result);
     });
+    web.on("/api/info", HTTP_GET, []() { web.send(200, "application/json", "{\"firmware\":\"1.5.4\",\"config_schema\":1}"); });
+    web.on("/api/config", HTTP_GET, sendConfigState);
+    web.on("/api/config/stage", HTTP_POST, requestConfigChange);
+    web.on("/api/config/confirm", HTTP_POST, confirmConfig);
     web.on("/api/status", HTTP_GET, sendStatus);
     web.on("/api/logs", HTTP_GET, sendLogs);
     web.on("/api/preview", HTTP_GET, sendPreview);
@@ -491,6 +514,10 @@ void registerRoutes() {
             web.sendHeader("Access-Control-Allow-Private-Network", "true");
             web.send(204, "text/plain", "");
             return;
+        }
+        if (apActive && (web.method() == HTTP_GET || web.method() == HTTP_HEAD) &&
+            !web.uri().startsWith("/api/") && !web.uri().startsWith("/download/")) {
+            sendCaptiveRedirect(); return;
         }
         web.send(404, "text/plain", "Page introuvable");
     });

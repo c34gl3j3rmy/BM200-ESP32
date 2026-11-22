@@ -1,7 +1,7 @@
 /*
- * ANCEL BM200 - BLE to Wi-Fi gateway V1.5.3 Core4 RSN Override workaround and AP-only fallback.
+ * ANCEL BM200 - BLE to Wi-Fi gateway - V1.5.4 + captive portal + NVS.
  * Board: ESP32-WROOM-32 / ESP32 Dev Module (classic ESP32).
- * Arduino ESP32 cores 3.3.13 / 4.0.0 and NimBLE-Arduino 2.5.x.
+ * Arduino ESP32 core 4.0.0 and NimBLE-Arduino 2.5.x.
  *
  * Read-only requests backed by captured protocol evidence: live D1 55 07, history D1 55 05, startup report D1 55 03.
  * No GPS, alarm configuration, charge tests or parameter writes.
@@ -16,21 +16,28 @@
 #include <esp_attr.h>
 #include <esp_heap_caps.h>
 #include <WiFi.h>
+#include <esp_arduino_version.h>
 #if ESP_ARDUINO_VERSION_MAJOR >= 4
 #include <esp_wifi.h>
 #include <esp_err.h>
 #endif
 #include <ESPmDNS.h>
 #include <WebServer.h>
+#include <DNSServer.h>
+#include <esp_idf_version.h>
 #include <LittleFS.h>
+#include <Preferences.h>
 #include "esp32-hal-alloc-ble-mem.h"
 #include <NimBLEDevice.h>
 #include <sys/time.h>
 #include <time.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <string.h>
 
 #include "Config.h"
+void addLog(const char* level, const char* fmt, ...);
+#include "DeviceConfigModule.h"
 #include "BM200Protocol.h"
 
 
@@ -39,8 +46,8 @@ constexpr size_t MAX_SLOTS = 709;
 constexpr size_t MAX_HISTORY_BYTES = MAX_SLOTS * 4;
 constexpr size_t MAX_BLE_PACKET = 192;        // Captures show 16- or 160-byte messages.
 constexpr size_t BLE_QUEUE_DEPTH = 48;
-constexpr size_t LOG_CAPACITY = 90;
-constexpr size_t LOG_LINE_SIZE = 182;
+constexpr size_t LOG_CAPACITY = 32;
+constexpr size_t LOG_LINE_SIZE = 128;
 // NimBLE host scan timeout completion code (BLE_HS_ETIMEOUT).
 // Keep this local: NimBLE-Arduino does not expose its internal host headers
 // through the Arduino sketch include path.
@@ -159,12 +166,15 @@ bool wifiRecoveringAfterLoss = false;
 bool forcedAPMode = false;
 bool io0Pressed = false;
 bool io0Handled = false;
+static bool io0ConfigPressDone = false;
 uint32_t io0PressedSince = 0;
 uint32_t ledLastToggle = 0;
 bool ledLogicalOn = false;
 
-// Forward declaration used by WebApiModule.h.
+// Forward declarations for the single-unit Arduino modules.
 bool initializeBleEngine(const char* origin);
+void applyStagedConfigAfterButton();
+void maintainConfigTransition();
 
 // Internal modules are included after shared state so they keep the same
 // single-translation-unit behavior as the validated V1.3.0 firmware.
@@ -174,7 +184,10 @@ bool initializeBleEngine(const char* origin);
 #include "BLEStartModule.h"
 #include "BLESyncModule.h"
 #include "BLELiveModule.h"
+#include "CaptivePortalModule.h"
 #include "WiFiModule.h"
+#include "ConfigApiModule.h"
+#include "LocalConfigPage.h"
 #include "WebApiModule.h"
 
 bool initializeBleEngine(const char* origin) {
@@ -211,7 +224,7 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(250);
     Serial.println();
-    Serial.println("==== ANCEL BM200 ESP32 Wi-Fi Gateway V1.5.3 Core4 RSN+AP ====");
+    Serial.println("==== ANCEL BM200 ESP32 V1.5.4 + portail captif ====");
     Serial.printf("[BOOT] Arduino ESP32 Core %d.%d.%d\n",
                   ESP_ARDUINO_VERSION_MAJOR, ESP_ARDUINO_VERSION_MINOR,
                   ESP_ARDUINO_VERSION_PATCH);
@@ -242,8 +255,7 @@ void setup() {
     }
     interruptedSyncMarker = 0;
 
-    // Protect existing measurements when changing Arduino core versions.
-    // Never format LittleFS automatically on a failed mount.
+    // Never format an existing LittleFS partition automatically.
     fsReady = LittleFS.begin(ALLOW_LITTLEFS_AUTOFORMAT);
     addLog(fsReady ? "INFO" : "ERROR", "LittleFS: %s", fsReady ? "monte" : "echec du montage");
     if (fsReady) {
@@ -268,16 +280,17 @@ void setup() {
         digitalWrite(STATUS_LED_PIN, STATUS_LED_ACTIVE_HIGH ? LOW : HIGH);
     }
 
+    loadDeviceConfig();
+    addLog("INFO", "Configuration NVS chargee: Wi-Fi %s", WIFI_STA_SSID[0] ? "configure" : "a configurer");
     ramCheckpoint("avant_wifi");
     initWiFi();
+    maintainCaptivePortal();
     ramCheckpoint("apres_wifi_init");
 
     ramCheckpoint("avant_serveur_web");
     registerRoutes();
     ensureNetworkHttp();
-    if (!httpServerStarted) {
-        addLog("WARN", "Serveur HTTP en attente du reseau Wi-Fi");
-    }
+    if (!httpServerStarted) addLog("WARN", "Serveur HTTP en attente du reseau Wi-Fi");
     ramCheckpoint("serveur_web_actif");
 
     if (!initBm200Crypto()) {
@@ -292,19 +305,13 @@ void setup() {
 }
 
 void loop() {
-    // 30-second heartbeat for network diagnosis and RAM monitoring.
-    static uint32_t diagLast = 0;
-    if (millis() - diagLast >= 30000) {
-        diagLast = millis();
-        Serial.printf("[DIAG] loop actif, mode=%d, AP clients=%u, HTTP=handleClient, RAM=%u\n",
-                      static_cast<int>(WiFi.getMode()),
-                      static_cast<unsigned>(WiFi.softAPgetStationNum()),
-                      static_cast<unsigned>(ESP.getFreeHeap()));
-    }
     maintainWiFiButton();
+    maintainConfigTransition();
+    maintainDiagnosticsTimeout();
     maintainWiFi();
+    maintainCaptivePortal();
     ensureNetworkHttp();
     maintainStatusLed();
     if (httpServerStarted) web.handleClient();
-    delay(2); // Same scheduling as the official HelloServer example.
+    delay(2);
 }

@@ -10,7 +10,6 @@ void stopNetworkHttp() {
     httpServerStarted = false;
     addLog("DEBUG", "HTTP: arret du serveur avant changement de reseau");
 }
-
 void stopNetworkMdns() {
     if (!mdnsActive) return;
     MDNS.end();
@@ -21,14 +20,14 @@ void startFallbackAP() {
     if (apActive) return;
     stopNetworkHttp();
     stopNetworkMdns();
-
-    // Completely leave station mode. Never keep a pending STA connection
-    // active while the emergency access point is serving HTTP requests.
+    // Leave station mode, cancelling pending STA requests before enabling the AP.
     WiFi.setAutoReconnect(false);
     WiFi.disconnect(true, false);
     WiFi.mode(WIFI_AP);
     const IPAddress ip(192, 168, 4, 1);
-    if (!WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0))) {
+    // Tell DHCP clients to use our DNS: Android can discover the captive portal.
+    if (!WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0),
+                            IPAddress(0, 0, 0, 0), ip)) {
         addLog("WARN", "Wi-Fi secours: configuration IP refusee");
     }
     ramCheckpoint("avant_wifi_secours");
@@ -47,21 +46,16 @@ void startFallbackAP() {
     addLog("INFO", "Wi-Fi secours AP seul: %s, IP http://%s, mode=%d",
            WIFI_AP_NAME, WiFi.softAPIP().toString().c_str(),
            static_cast<int>(WiFi.getMode()));
-    // The HTTP server starts only after the AP network is ready, in setup/loop.
+    // HTTP is started from setup/loop once the new interface is ready.
 }
 
-// Core 4.x (ESP-IDF 6.x): on Freebox WPA2/3 Compatible Mode,
-// the newer driver can fail the RSN Override (WPA3) handshake (reason 17).
-// The minimal diagnostic confirmed that disabling only this ESP32 feature
-// permits a successful WPA2-AES connection without changing router settings.
-// Core 3.x retains the previously working standard Arduino WiFi.begin().
+// Core4 (ESP-IDF 6.x) can fail RSN Override on a WPA2/WPA3 mixed Freebox.
+// Disable only the extra WPA3-compatible RSN negotiation on Core4.
+// Core3 keeps the original WiFi.begin() path.
 bool beginHomeSTAConnection() {
 #if ESP_ARDUINO_VERSION_MAJOR >= 4
-    WiFi.setAutoReconnect(false); // Network transitions are managed by loop().
-
-    // Prepare credentials, but do not start the WPA handshake yet.
+    WiFi.setAutoReconnect(false);
     WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD, 0, nullptr, false);
-
     wifi_config_t cfg = {};
     esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &cfg);
     if (err != ESP_OK) {
@@ -113,7 +107,6 @@ void setStatusLed(bool on) {
     ledLogicalOn = on;
     digitalWrite(STATUS_LED_PIN, (on == STATUS_LED_ACTIVE_HIGH) ? HIGH : LOW);
 }
-
 void enterForcedAPMode() {
     if (apActive) return;
     forcedAPMode = true;
@@ -122,13 +115,11 @@ void enterForcedAPMode() {
     addLog("INFO", "IO0: secours AP force; ouvrir http://192.168.4.1/api/ping");
     ramCheckpoint("wifi_secours_force");
 }
-
 void leaveForcedAPMode() {
-    if (!apActive) return;
+    if (!apActive || !WIFI_STA_SSID[0]) return;
     startHomeSTA("IO0: nouvel essai manuel");
     ramCheckpoint("wifi_retour_maison");
 }
-
 void maintainWiFiButton() {
     const uint32_t now = millis();
     const bool pressed = digitalRead(WIFI_MODE_BUTTON_PIN) == LOW;
@@ -136,8 +127,14 @@ void maintainWiFiButton() {
         io0Pressed = true;
         io0Handled = false;
         io0PressedSince = now;
+        io0ConfigPressDone = false;
     }
-    if (pressed && !io0Handled && now - io0PressedSince >= WIFI_MODE_BUTTON_HOLD_MS) {
+    if (pressed && configPending && !io0ConfigPressDone && now - io0PressedSince >= CONFIG_BUTTON_HOLD_MS) {
+        io0ConfigPressDone = true;
+        io0Handled = true;
+        applyStagedConfigAfterButton();
+    }
+    if (pressed && !configPending && !io0Handled && now - io0PressedSince >= WIFI_MODE_BUTTON_HOLD_MS) {
         io0Handled = true;
         if (apActive) leaveForcedAPMode();
         else enterForcedAPMode();
@@ -147,7 +144,6 @@ void maintainWiFiButton() {
         io0Handled = false;
     }
 }
-
 void maintainStatusLed() {
     if (!STATUS_LED_ENABLED) return;
     const uint32_t now = millis();
@@ -167,20 +163,20 @@ void maintainStatusLed() {
         setStatusLed(!ledLogicalOn);
     }
 }
-
 void initWiFi() {
     WiFi.persistent(false);
-    // AP connection notifications are informative only. They run in a
-    // separate Wi-Fi task: do not change WebServer/WiFi state in callbacks.
+    // Only report clients from callbacks; manage WiFi/WebServer in loop().
     WiFi.onEvent([](arduino_event_id_t) {
         Serial.println("[WIFI] Client connecte au point d'acces");
     }, ARDUINO_EVENT_WIFI_AP_STACONNECTED);
     WiFi.onEvent([](arduino_event_id_t) {
         Serial.println("[WIFI] Client deconnecte du point d'acces");
     }, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
-
-    // Preserve the successful HelloServer / V1.5.1 startup sequence.
-    // No AP, no BLE and no WebServer yet while joining the home Wi-Fi.
+    if (!WIFI_STA_SSID[0]) {
+        addLog("INFO", "Aucun Wi-Fi configure: portail captif de premiere installation");
+        startFallbackAP();
+        return;
+    }
     WiFi.mode(WIFI_STA);
     beginHomeSTAConnection();
     wifiAttemptStartedAt = millis();
@@ -202,28 +198,23 @@ void initWiFi() {
         startFallbackAP();
     }
 }
-
-// Called by setup()/loop() only after registerRoutes() has run.
 void ensureNetworkHttp() {
     const bool ready = apActive || WiFi.status() == WL_CONNECTED;
     if (ready && !httpServerStarted) {
         web.begin();
         httpServerStarted = true;
-        addLog("INFO", "Serveur HTTP demarre sur %s port 80",
-               apActive ? "AP" : "STA");
+        addLog("INFO", "Serveur HTTP demarre sur %s port 80", apActive ? "AP" : "STA");
     } else if (!ready && httpServerStarted) {
         stopNetworkHttp();
     }
 }
-
 void maintainWiFi() {
     const uint32_t now = millis();
     if (apActive) {
         const uint32_t clients = WiFi.softAPgetStationNum();
         if (clients != 0) apLastClientSeenAt = now;
-        // Automatic return to the home WLAN is only attempted with no AP
-        // clients, and never while the user has explicitly forced AP mode.
-        if (!forcedAPMode && clients == 0 &&
+        // Don't interrupt a connected captive-portal client.
+        if (!configAwaitingAck && !configPending && !configAwaitingNetwork && WIFI_STA_SSID[0] && !forcedAPMode && clients == 0 &&
             now - apStartedAt >= WIFI_AP_HOME_RETRY_INTERVAL_MS &&
             now - apLastClientSeenAt >= WIFI_AP_IDLE_BEFORE_RETRY_MS) {
             addLog("INFO", "Wi-Fi secours sans client: recherche du reseau maison");
@@ -231,16 +222,13 @@ void maintainWiFi() {
         }
         return;
     }
-
     if (forcedAPMode) {
-        // If softAP previously failed, retry it without attempting STA.
         if (lastAPAttempt == 0 || now - lastAPAttempt >= WIFI_AP_RETRY_INTERVAL_MS) {
             lastAPAttempt = now;
             startFallbackAP();
         }
         return;
     }
-
     const bool connected = WiFi.status() == WL_CONNECTED;
     if (connected) {
         if (!previousSTAConnected) {
@@ -256,7 +244,6 @@ void maintainWiFi() {
         }
         return;
     }
-
     if (previousSTAConnected) {
         previousSTAConnected = false;
         staAttemptRunning = true;
@@ -265,8 +252,7 @@ void maintainWiFi() {
         stopNetworkHttp();
         stopNetworkMdns();
 #if ESP_ARDUINO_VERSION_MAJOR >= 4
-        // Core 4 uses manual reconnection (auto reconnect is intentionally off).
-        // Try exactly once; never issue repeated esp_wifi_connect() calls.
+        // One reconnect attempt only, no concurrent esp_wifi_connect calls.
         const esp_err_t retryErr = esp_wifi_connect();
         addLog(retryErr == ESP_OK ? "INFO" : "WARN",
                "Wi-Fi Core4: tentative unique de reconnexion: %s",
@@ -283,5 +269,3 @@ void maintainWiFi() {
         startFallbackAP();
     }
 }
-
-// HTTP helpers. Accessible from the home WLAN or from the fallback AP.

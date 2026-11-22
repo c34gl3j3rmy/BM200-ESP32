@@ -9,3 +9,5 @@ pre{background:#141827;border:1px solid #363e54;color:#cbd7e9;max-height:285px;o
 @media(max-width:650px){.split{grid-template-columns:1fr}.gauge{width:min(88vw,360px);height:200px}.gaugeCenter{top:30px}.gaugeCenter .soc{font-size:72px}.gauge .caption{font-size:15px}.card{padding:13px}.actions{gap:8px}.action{font-size:13px;padding:15px 7px}.signal strong{font-size:12px}.signal .detail{font-size:10px}.values{gap:6px}.valuebox .icon{font-size:23px}.valuebox .label{font-size:14px}}@media(max-width:380px){.gauge{width:92vw;height:185px}.gaugeCenter{top:25px}.gaugeCenter .soc{font-size:62px}.gaugeCenter .label{font-size:20px}.signals{gap:5px}.signal{padding:7px 3px}.bars i{width:6px}}
 
 .endpoint input{min-width:180px;max-width:100%;flex:1;padding:10px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--text)}.endpoint label{display:block;font-weight:600;margin-bottom:8px}
+
+#device-settings form{display:grid;gap:8px}#device-settings input,#device-settings select{width:100%;max-width:100%;box-sizing:border-box}#device-settings label{font-weight:600;margin-top:7px}#device-settings .controls{margin-top:12px;flex-wrap:wrap}

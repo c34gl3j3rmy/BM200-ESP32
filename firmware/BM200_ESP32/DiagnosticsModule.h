@@ -11,6 +11,9 @@ String utcNow() {
 }
 
 void addLog(const char* level, const char* fmt, ...) {
+    // Do not spend heap/serial/flash on verbose traces in normal mode.
+    if (strcmp(level, "DEBUG") == 0 && diagnosticLevel < 1) return;
+    if (strcmp(level, "RAM") == 0 && diagnosticLevel < 2) return;
     char message[LOG_LINE_SIZE - 38];
     va_list args;
     va_start(args, fmt);
@@ -46,7 +49,7 @@ void ramCheckpoint(const char* event) {
     addLog("RAM", "%s: libre=%lu Ko, delta=%ld octets, min=%lu Ko, bloc=%lu Ko", event,
         static_cast<unsigned long>(freeNow / 1024), static_cast<long>(delta),
         static_cast<unsigned long>(sdkMinimum / 1024), static_cast<unsigned long>(largest / 1024));
-    if (!fsReady) return;
+    if (!fsReady || diagnosticLevel < 2) return;
     File f = LittleFS.open(PATH_RAM_DIAG, "a");
     if (!f) return;
     f.print(millis()); f.print(',');

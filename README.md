@@ -1,84 +1,50 @@
-# BM200 ESP32 - V1.5.3 (Wi-Fi STA + AP de secours)
+# BM200 ESP32 - V1.5.4 + portail captif (essai)
 
-Passerelle locale BLE / Wi-Fi pour le moniteur de batterie ANCEL BM200. Le firmware
-ESP32 collecte des mesures, conserve un historique LittleFS et expose une API HTTP.
-La PWA statique dans `web/` est publiee separement via GitHub Pages.
+> Archive de test preassemblee. Pour installer directement sans script, lire [00_LIRE_EN_PREMIER.md](00_LIRE_EN_PREMIER.md). Elle est basee sur les sources initiales V1.5.0 et reprend les ajustements Wi-Fi documentes de V1.5.4 ; elle n'est pas une extraction exacte de la derniere version GitHub.
 
-## Ce qui change dans la V1.5.3
 
-- Le Wi-Fi domestique est initialise en premier, comme dans la V1.5.1 validee
-  sur `WifiGG`. Le serveur HTTP n'est ouvert qu'apres connexion au reseau.
-- Si la connexion domestique echoue apres 20 s (ou disparait pendant 12 s),
-  basculement dans un veritable `WIFI_AP`, sans connexion STA simultanee.
-- Le point d'acces `BM200-ESP32` utilise `http://192.168.4.1`.
-- Appui long de 5 s sur BOOT/IO0 : maison -> secours force, ou secours ->
-  nouvel essai de connexion maison. Ne pas maintenir BOOT pendant un reset.
-- Sans client connecte au secours, essai automatique du Wi-Fi domestique au
-  bout de 15 min ; avec un client, l'AP n'est pas interrompu.
-- Pas de `WiFi.reconnect()` repetitif pendant le secours.
-- Compatible au niveau du code avec Arduino ESP32 Core 3.3.13 (mbedTLS AES)
-  et 4.0.0 (PSA Crypto AES), avec NimBLE-Arduino 2.5.2.
-- Protection de LittleFS : pas de formatage automatique si le montage echoue.
+Firmware ESP32 + frontend PWA déployé sur GitHub Pages.
 
 ## Installation
+1. Arduino IDE : ouvrir `firmware/BM200_ESP32/BM200_ESP32.ino`.
+2. Aucun `Secrets.h` requis : configurer depuis le portail captif ou la PWA, puis confirmer physiquement avec IO0.
+3. Conserver ESP32 Core 4.0.0, NimBLE-Arduino 2.5.x, ESP32 Dev Module et partition Huge APP selon flash.
+4. Créer un dépôt GitHub, envoyer les fichiers, activer **Settings > Pages > Source: GitHub Actions**.
+5. Ouvrir l’URL GitHub Pages dans Chrome, installer la PWA et configurer l’adresse API (par défaut `http://192.168.4.1`).
+6. Autoriser l'accès au réseau local si le navigateur le demande. Chrome/LNA reste à tester sur l'appareil réel ; HTTPS→HTTP local peut ne pas fonctionner sur certains navigateurs/versions.
 
-1. Sauvegarder les donnees existantes depuis l'API qui fonctionne :
-   `/download/history.csv`, `/download/history.json` et `/download/ram.csv`.
-2. Decompresser le ZIP et copier l'ancien `Secrets.h` prive dans
-   `firmware/BM200_ESP32/` (le ZIP ne contient aucun mot de passe).
-3. Ouvrir `firmware/BM200_ESP32/BM200_ESP32.ino` dans Arduino IDE.
-4. Choisir ESP32 Dev Module, Flash 4 MB, Huge APP (3 MB No OTA / 1 MB SPIFFS),
-   PSRAM Disabled et Erase All Flash **Disabled**.
-5. Conserver d'abord le Core 3.3.13 pour tester le retour du secours AP.
-   Si l'API maison reste OK, passer ensuite au Core 4.0.0 sans autre changement.
-6. Installer ou conserver `NimBLE-Arduino` **2.5.2**.
-7. Ouvrir le Moniteur serie a 115200 bauds ; lire la version Core et l'IP.
+## Limites et sécurité
+- **Phase 1 de migration** : l'interface a été externalisée et la sauvegarde IndexedDB des mots historiques est disponible ; la synchro BLE incrémentale reste **à développer**. La commande D15503 est maintenant lancée dans la connexion utilisée par la synchronisation (à valider sur appareil).
+- Les 709 mots de 4 octets sont transmis via `/api/history.bin` sans fabrication d'un grand JSON ; conservation des marqueurs et ordre du CSV. Les horodatages historiques ne sont pas inventés.
+- La PWA utilise le stockage navigateur. Une capture peut contenir des mots déjà acquis ; aucune fusion automatique n'est tentée sans identifiants de mesure fiables.
+- L’ESP32 conserve ses fichiers LittleFS comme sécurité tant que le téléphone n’a pas acquis et sauvegardé les données.
+- Cette première version utilise `Access-Control-Allow-Origin: *` pour faciliter le test avec un dépôt GitHub Pages encore inconnu : **ne pas exposer ce serveur à Internet**, ne pas l'utiliser sur un réseau partagé non fiable. Renforcer l’authentification et CORS avant tout accès réseau non contrôlé.
+- Le protocole AES/commandes reste inchangé. Le moteur BLE enchaîne D15503 après D15505 avant la déconnexion, avec conservation du bouton Forcer reconnexion.
+- Le Service Worker met uniquement les fichiers de la PWA en cache, jamais les requêtes à l’ESP32.
+- La compilation ESP32 Core 4.0.0 et le fonctionnement Chrome LNA restent à valider sur appareil réel.
 
-## Validation minimale (sans PWA)
-
-- Sur le Wi-Fi maison : ouvrir `http://<IP-ESP32>/api/ping` puis `/api/status`.
-- Eloigner l'ESP32 du reseau domestique ou maintenir BOOT pendant 5 s apres
-  le demarrage : le secours `BM200-ESP32` doit apparaitre et afficher une IP
-  `192.168.4.1` dans le journal.
-- Depuis un telephone connecte a ce reseau, ouvrir
-  `http://192.168.4.1/api/ping`. Resultat attendu : `PONG`.
-- En secours, maintenir BOOT pendant 5 s : nouvelle tentative `WifiGG`.
-- Verifier ensuite les fonctions BLE et les exports d'historique.
-
-**Important :** des essais precedents avec un croquis AP minimal renvoyaient
-`ERR_CONNECTION_RESET`, meme sans code BM200. La cause materielle / pile Wi-Fi /
-telephone n'a PAS ete identifiee. La nouvelle logique evite les reconnexions
-concurrentes mais ne garantit pas que ce symptome est corrige.
-
-## Tests et compilation
-
-Tests locaux independants du materiel :
-
+## Tests locaux (sans ESP32)
 ```sh
 python3 tests/check_offline.py
 python3 tests/check_core4_crypto.py
 ```
+Le test du navigateur Chrome et une compilation/téléversement ESP32 doivent être faits sur le matériel.
 
-La workflow GitHub Actions `Compiler le firmware BM200` est disponible en
-lancement manuel pour tenter une compilation des Core 3.3.13 et 4.0.0.
-L'execution sur la carte et le test du mode AP ne peuvent pas etre simules.
+## Étapes de validation (dans cet ordre)
+1. Sauvegarder les fichiers CSV/JSON de l’ESP32 actuellement opérationnel.
+2. Vérifier l’installation PWA et son cache hors ligne (mode avion, page déjà installée).
+3. Vérifier l’accès HTTPS GitHub Pages → HTTP local sur **Chrome Android actuel** : permission locale, CORS, préflight Private Network Access. Si le navigateur refuse la connexion, conserver la V1.4.4 fonctionnelle et ne pas migrer sans un accès HTTPS local adapté.
+4. Compiler et téléverser la V1.5.0, lire `/api/status` et `/api/logs` en local.
+5. Tester Live, synchronisation 10 mesures et lecture D15503 sur une seule connexion BLE, puis 709 mesures.
+6. Archiver une capture depuis la PWA et exporter l’archive JSON, puis couper le réseau et vérifier le chargement de l’UI.
 
-La compilation Arduino et le fonctionnement reel sur Core 4.0.0 doivent etre
-verifies sur le materiel avant de considerer la migration comme validee.
+**Non validé dans cette archive** : compilation Arduino réelle, test HTTPS→HTTP Chrome, mesures de gain RAM/Flash et tests BLE sur BM200.
 
-## Depot / PWA
 
-- `firmware/BM200_ESP32/` : croquis et modules embarques.
-- `web/` : PWA statique et stockage navigateur IndexedDB.
-- `tests/` : tests du protocole et de la machine d'etats Wi-Fi.
-- `.github/workflows/pages.yml` : publication automatique de la PWA.
-- `.github/workflows/firmware-compile.yml` : compilation manuelle optionnelle.
+## Configuration dans la V1.5.4
 
-La PWA utilise une adresse d'API configurable : renseigner l'adresse locale
-reelle de l'ESP32 quand il est sur `WifiGG` et `http://192.168.4.1` en secours.
-L'acces HTTPS de GitHub Pages a une API HTTP locale peut etre restreint par
-le navigateur ; toujours commencer les tests avec l'adresse HTTP directe.
-
-Securite : le serveur HTTP local ne possede pas d'authentification ; ne pas
-l'exposer a Internet ou a un reseau Wi-Fi public. Conserver `Secrets.h`
-strictement en local ; le depot et l'archive ne contiennent aucun identifiant.
+`Secrets.h` a ete supprime. Les parametres Wi-Fi sont charges depuis Preferences/NVS.
+Premier demarrage : Wi-Fi `BM200-ESP32` (mot de passe usine public `BM200-Setup`), puis `/config` ou la PWA.
+Toute modification exige la confirmation physique IO0 (maintien 2 s). Les nouveaux identifiants Wi-Fi ne sont definitivement sauvegardes qu'apres la validation de la reconnexion (delai de 120 s). Sans confirmation, le firmware restaure la derniere configuration connue.
+Le niveau de journalisation `Complet` s'eteint apres 15 min.
+Lire `00_LIRE_EN_PREMIER.md` pour la procedure et les limites de securite.
